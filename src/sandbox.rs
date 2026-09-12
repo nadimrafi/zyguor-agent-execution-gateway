@@ -1,18 +1,112 @@
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use std::{sync::mpsc, thread, time::Duration};
 
-#[cfg(test)]
-use wasmtime::{StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
-#[cfg(test)]
-use std::{thread, time::Duration};
-
-#[cfg(test)]
 struct SandboxState {
     limits: StoreLimits,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxConfig {
+    pub fuel_limit: u64,
+    pub memory_limit_bytes: usize,
+    pub timeout: Duration,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            fuel_limit: 10_000,
+            memory_limit_bytes: 2 * 1024 * 1024,
+            timeout: Duration::from_millis(250),
+        }
+    }
+}
+
+pub struct SandboxExecutor {
+    config: SandboxConfig,
+}
+
+impl SandboxExecutor {
+    pub fn new(config: SandboxConfig) -> Self {
+        Self { config }
+    }
+
+    #[cfg(test)]
+    pub fn config(&self) -> SandboxConfig {
+        self.config
+    }
+
+    pub fn run_addition(&self, left: i32, right: i32) -> Result<i32, String> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+
+        let engine = Engine::new(&config)
+            .map_err(|error| format!("failed to create Wasmtime engine: {error}"))?;
+
+        let wasm = r#"
+            (module
+                (func (export "add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wasm)
+            .map_err(|error| format!("failed to compile Wasm module: {error}"))?;
+
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.config.memory_limit_bytes)
+            .trap_on_grow_failure(true)
+            .build();
+
+        let mut store = Store::new(&engine, SandboxState { limits });
+
+        store.limiter(|state| &mut state.limits);
+
+        store
+            .set_fuel(self.config.fuel_limit)
+            .map_err(|error| format!("failed to configure Wasm fuel: {error}"))?;
+
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+
+        let instance = Instance::new(&mut store, &module, &[])
+            .map_err(|error| format!("failed to instantiate Wasm module: {error}"))?;
+
+        let add = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "add")
+            .map_err(|error| format!("failed to load add function: {error}"))?;
+
+        let timeout = self.config.timeout;
+        let timer_engine = engine.clone();
+
+        let (cancel_sender, cancel_receiver) = mpsc::channel::<()>();
+
+        let timer = thread::spawn(move || {
+            if cancel_receiver.recv_timeout(timeout).is_err() {
+                timer_engine.increment_epoch();
+            }
+        });
+
+        let execution_result = add.call(&mut store, (left, right));
+
+        let _ = cancel_sender.send(());
+
+        timer
+            .join()
+            .map_err(|_| "sandbox timeout thread failed".to_owned())?;
+
+        execution_result.map_err(|error| format!("Wasm execution failed: {error}"))
+    }
+}
+#[cfg(test)]
 const DEFAULT_FUEL: u64 = 10_000;
 
+#[cfg(test)]
 pub fn run_addition(left: i32, right: i32) -> Result<i32, String> {
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -176,9 +270,10 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
+
     use super::{
-        run_addition, run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
-        run_memory_growth_with_limit,
+        SandboxConfig, SandboxExecutor, run_addition, run_infinite_loop_with_epoch_timeout,
+        run_infinite_loop_with_fuel, run_memory_growth_with_limit,
     };
     use std::time::Duration;
     #[test]
@@ -217,5 +312,28 @@ mod tests {
         assert_eq!(result, 3);
 
         Ok(())
+    }
+    #[test]
+    fn sandbox_config_has_safe_defaults() {
+        let config = SandboxConfig::default();
+
+        assert_eq!(config.fuel_limit, 10_000);
+        assert_eq!(config.memory_limit_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn sandbox_executor_keeps_configuration() {
+        let config = SandboxConfig {
+            fuel_limit: 5_000,
+            memory_limit_bytes: 1024 * 1024,
+            timeout: Duration::from_millis(100),
+        };
+
+        let executor = SandboxExecutor::new(config);
+
+        assert_eq!(executor.config().fuel_limit, 5_000);
+        assert_eq!(executor.config().memory_limit_bytes, 1024 * 1024);
+        assert_eq!(executor.config().timeout, Duration::from_millis(100));
     }
 }

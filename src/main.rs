@@ -1,10 +1,9 @@
 mod audit;
 mod policy;
 mod sandbox;
-
 use audit::{AuditRecord, ExecutionOutcome, persist_audit};
 use policy::evaluate_message;
-use sandbox::run_addition;
+use sandbox::{SandboxConfig, SandboxExecutor};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -103,7 +102,9 @@ where
 }
 
 fn execute_message(message: &str) -> Result<String, String> {
-    execute_message_with_audit(message, persist_audit, || run_addition(2, 3))
+    let executor = SandboxExecutor::new(SandboxConfig::default());
+
+    execute_message_with_audit(message, persist_audit, || executor.run_addition(2, 3))
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
