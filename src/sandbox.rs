@@ -1,5 +1,12 @@
 use wasmtime::{Config, Engine, Instance, Module, Store};
 
+#[cfg(test)]
+use wasmtime::{StoreLimits, StoreLimitsBuilder};
+#[cfg(test)]
+struct SandboxState {
+    limits: StoreLimits,
+}
+
 const DEFAULT_FUEL: u64 = 10_000;
 
 pub fn run_addition(left: i32, right: i32) -> Result<i32, String> {
@@ -77,8 +84,53 @@ pub fn run_infinite_loop_with_fuel(fuel: u64) -> Result<(), String> {
         .map_err(|error| format!("Wasm execution failed: {error}"))
 }
 #[cfg(test)]
+pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), String> {
+    let engine = Engine::default();
+
+    let wasm = r#"
+        (module
+            (memory 1)
+            (func (export "grow")
+                i32.const 100
+                memory.grow
+                drop
+            )
+        )
+    "#;
+
+    let module = Module::new(&engine, wasm)
+        .map_err(|error| format!("failed to compile Wasm module: {error}"))?;
+
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(memory_limit_bytes)
+        .trap_on_grow_failure(true)
+        .build();
+
+    let mut store = Store::new(&engine, SandboxState { limits });
+
+    store.limiter(|state| &mut state.limits);
+
+    let instance = Instance::new(&mut store, &module, &[])
+        .map_err(|error| format!("failed to instantiate Wasm module: {error}"))?;
+
+    let grow = instance
+        .get_typed_func::<(), ()>(&mut store, "grow")
+        .map_err(|error| format!("failed to load grow function: {error}"))?;
+
+    grow.call(&mut store, ())
+        .map_err(|error| format!("Wasm memory growth failed: {error}"))
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{run_addition, run_infinite_loop_with_fuel};
+    use super::{run_addition, run_infinite_loop_with_fuel, run_memory_growth_with_limit};
+
+    #[test]
+    fn blocks_wasm_memory_growth_beyond_limit() {
+        let result = run_memory_growth_with_limit(128 * 1024);
+
+        assert!(result.is_err());
+    }
 
     #[test]
     fn executes_wasm_addition() -> Result<(), String> {

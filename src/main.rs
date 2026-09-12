@@ -6,6 +6,9 @@ use audit::{AuditRecord, ExecutionOutcome, persist_audit};
 use policy::evaluate_message;
 use sandbox::run_addition;
 
+#[cfg(test)]
+use sandbox::run_infinite_loop_with_fuel;
+
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
 };
@@ -124,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod gateway_tests {
-    use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit};
+    use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit, run_infinite_loop_with_fuel};
 
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
         Ok(())
@@ -133,9 +136,22 @@ mod gateway_tests {
     fn sandbox_success() -> Result<i32, String> {
         Ok(5)
     }
+    fn sandbox_real_fuel_failure() -> Result<i32, String> {
+        run_infinite_loop_with_fuel(1_000)?;
+        Ok(0)
+    }
 
     fn sandbox_failure() -> Result<i32, String> {
         Err("simulated sandbox failure".to_owned())
+    }
+    fn capture_failed_audit(record: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
+        assert_eq!(record.decision, crate::policy::PolicyDecision::Allow);
+        assert_eq!(
+            record.execution_outcome,
+            crate::audit::ExecutionOutcome::Failed
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -274,6 +290,44 @@ mod gateway_tests {
 
         assert_eq!(json["decision"], "Block");
         assert_eq!(json["execution_outcome"], "NotExecuted");
+
+        Ok(())
+    }
+
+    #[test]
+    fn real_wasmtime_resource_failure_is_reported() -> Result<(), String> {
+        let result = execute_message_with_audit(
+            "read the project status",
+            no_op_audit,
+            sandbox_real_fuel_failure,
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["status"], "execution_failed");
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["executed"], false);
+        assert_eq!(json["execution_outcome"], "Failed");
+        assert!(json["message"].is_null());
+
+        Ok(())
+    }
+    #[test]
+    fn real_wasmtime_failure_is_recorded_in_audit() -> Result<(), String> {
+        let result = execute_message_with_audit(
+            "read the project status",
+            capture_failed_audit,
+            sandbox_real_fuel_failure,
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["status"], "execution_failed");
+        assert_eq!(json["execution_outcome"], "Failed");
+        assert_eq!(json["executed"], false);
 
         Ok(())
     }
