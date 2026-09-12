@@ -4,6 +4,13 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ExecutionOutcome {
+    Success,
+    Failed,
+    NotExecuted,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct AuditRecord<'a> {
     pub request_id: Uuid,
@@ -11,6 +18,7 @@ pub struct AuditRecord<'a> {
     pub message: &'a str,
     pub decision: PolicyDecision,
     pub reason: PolicyReason,
+    pub execution_outcome: ExecutionOutcome,
 }
 
 impl<'a> AuditRecord<'a> {
@@ -18,6 +26,7 @@ impl<'a> AuditRecord<'a> {
         message: &'a str,
         decision: PolicyDecision,
         reason: PolicyReason,
+        execution_outcome: ExecutionOutcome,
     ) -> Result<Self, std::time::SystemTimeError> {
         let timestamp_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
@@ -29,6 +38,7 @@ impl<'a> AuditRecord<'a> {
             message,
             decision,
             reason,
+            execution_outcome,
         })
     }
 }
@@ -51,9 +61,10 @@ pub fn persist_audit(record: &AuditRecord<'_>) -> Result<(), String> {
 
     write_audit(&mut file, record)
 }
+
 #[cfg(test)]
 mod tests {
-    use super::{AuditRecord, write_audit};
+    use super::{AuditRecord, ExecutionOutcome, write_audit};
     use crate::policy::{PolicyDecision, PolicyReason};
 
     #[test]
@@ -62,6 +73,7 @@ mod tests {
             "read project status",
             PolicyDecision::Allow,
             PolicyReason::Safe,
+            ExecutionOutcome::Success,
         )
         .map_err(|error| format!("failed to create test audit record: {error}"))?;
 

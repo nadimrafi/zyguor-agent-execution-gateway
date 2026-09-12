@@ -1,9 +1,10 @@
 mod audit;
 mod policy;
+mod sandbox;
 
-use audit::{AuditRecord, persist_audit};
-
+use audit::{AuditRecord, ExecutionOutcome, persist_audit};
 use policy::evaluate_message;
+use sandbox::run_addition;
 
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router, transport::stdio,
@@ -13,6 +14,7 @@ use rmcp::{
 struct EchoParams {
     message: String,
 }
+
 #[derive(Debug, serde::Serialize)]
 struct GatewayResponse<'a> {
     request_id: uuid::Uuid,
@@ -21,6 +23,7 @@ struct GatewayResponse<'a> {
     reason: policy::PolicyReason,
     executed: bool,
     message: Option<&'a str>,
+    execution_outcome: ExecutionOutcome,
 }
 
 #[derive(Clone)]
@@ -50,38 +53,41 @@ where
 
     let evaluation = evaluate_message(message);
 
-    let audit_record = AuditRecord::new(message, evaluation.decision, evaluation.reason)
-        .map_err(|error| format!("failed to create audit record: {error}"))?;
+    let (status, executed, response_message, execution_outcome) = match evaluation.decision {
+        policy::PolicyDecision::Allow => match run_addition(2, 3) {
+            Ok(_) => ("executed", true, Some(message), ExecutionOutcome::Success),
+
+            Err(_) => ("execution_failed", false, None, ExecutionOutcome::Failed),
+        },
+
+        policy::PolicyDecision::Review => (
+            "held_for_review",
+            false,
+            None,
+            ExecutionOutcome::NotExecuted,
+        ),
+
+        policy::PolicyDecision::Block => ("blocked", false, None, ExecutionOutcome::NotExecuted),
+    };
+
+    let audit_record = AuditRecord::new(
+        message,
+        evaluation.decision,
+        evaluation.reason,
+        execution_outcome,
+    )
+    .map_err(|error| format!("failed to create audit record: {error}"))?;
 
     audit_writer(&audit_record)?;
 
-    let response = match evaluation.decision {
-        policy::PolicyDecision::Allow => GatewayResponse {
-            request_id: audit_record.request_id,
-            status: "executed",
-            decision: evaluation.decision,
-            reason: evaluation.reason,
-            executed: true,
-            message: Some(message),
-        },
-
-        policy::PolicyDecision::Review => GatewayResponse {
-            request_id: audit_record.request_id,
-            status: "held_for_review",
-            decision: evaluation.decision,
-            reason: evaluation.reason,
-            executed: false,
-            message: None,
-        },
-
-        policy::PolicyDecision::Block => GatewayResponse {
-            request_id: audit_record.request_id,
-            status: "blocked",
-            decision: evaluation.decision,
-            reason: evaluation.reason,
-            executed: false,
-            message: None,
-        },
+    let response = GatewayResponse {
+        request_id: audit_record.request_id,
+        status,
+        decision: evaluation.decision,
+        reason: evaluation.reason,
+        executed,
+        message: response_message,
+        execution_outcome,
     };
 
     serde_json::to_string(&response)
