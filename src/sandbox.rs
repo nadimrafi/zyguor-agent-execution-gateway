@@ -2,6 +2,10 @@ use wasmtime::{Config, Engine, Instance, Module, Store};
 
 #[cfg(test)]
 use wasmtime::{StoreLimits, StoreLimitsBuilder};
+
+#[cfg(test)]
+use std::{thread, time::Duration};
+
 #[cfg(test)]
 struct SandboxState {
     limits: StoreLimits,
@@ -84,6 +88,55 @@ pub fn run_infinite_loop_with_fuel(fuel: u64) -> Result<(), String> {
         .map_err(|error| format!("Wasm execution failed: {error}"))
 }
 #[cfg(test)]
+pub fn run_infinite_loop_with_epoch_timeout(timeout: Duration) -> Result<(), String> {
+    let mut config = Config::new();
+    config.epoch_interruption(true);
+
+    let engine = Engine::new(&config)
+        .map_err(|error| format!("failed to create Wasmtime engine: {error}"))?;
+
+    let wasm = r#"
+        (module
+            (func (export "run")
+                (loop
+                    br 0
+                )
+            )
+        )
+    "#;
+
+    let module = Module::new(&engine, wasm)
+        .map_err(|error| format!("failed to compile Wasm module: {error}"))?;
+
+    let mut store = Store::new(&engine, ());
+
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_trap();
+
+    let instance = Instance::new(&mut store, &module, &[])
+        .map_err(|error| format!("failed to instantiate Wasm module: {error}"))?;
+
+    let run = instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .map_err(|error| format!("failed to load run function: {error}"))?;
+
+    let timer_engine = engine.clone();
+
+    let timer = thread::spawn(move || {
+        thread::sleep(timeout);
+        timer_engine.increment_epoch();
+    });
+
+    let execution_result = run.call(&mut store, ());
+
+    timer
+        .join()
+        .map_err(|_| "epoch timer thread failed".to_owned())?;
+
+    execution_result.map_err(|error| format!("Wasm execution interrupted: {error}"))
+}
+
+#[cfg(test)]
 pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), String> {
     let engine = Engine::default();
 
@@ -123,8 +176,11 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use super::{run_addition, run_infinite_loop_with_fuel, run_memory_growth_with_limit};
-
+    use super::{
+        run_addition, run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
+        run_memory_growth_with_limit,
+    };
+    use std::time::Duration;
     #[test]
     fn blocks_wasm_memory_growth_beyond_limit() {
         let result = run_memory_growth_with_limit(128 * 1024);
@@ -139,6 +195,12 @@ mod tests {
         assert_eq!(result, 5);
 
         Ok(())
+    }
+    #[test]
+    fn interrupts_runaway_wasm_after_epoch_deadline() {
+        let result = run_infinite_loop_with_epoch_timeout(Duration::from_millis(50));
+
+        assert!(result.is_err());
     }
 
     #[test]
