@@ -3,7 +3,7 @@ mod policy;
 mod sandbox;
 use audit::{AuditRecord, ExecutionOutcome, persist_audit};
 use policy::evaluate_message;
-use sandbox::{SandboxConfig, SandboxExecutor};
+use sandbox::{ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -104,7 +104,13 @@ where
 fn execute_message(message: &str) -> Result<String, String> {
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
-    execute_message_with_audit(message, persist_audit, || executor.run_addition(2, 3))
+    execute_message_with_audit(message, persist_audit, || {
+        executor.execute(ExecutionRequest {
+            operation: SandboxOperation::Add,
+            left: 2,
+            right: 3,
+        })
+    })
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
@@ -128,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod gateway_tests {
+
     use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit, run_infinite_loop_with_fuel};
 
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {

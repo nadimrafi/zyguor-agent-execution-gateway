@@ -22,6 +22,16 @@ impl Default for SandboxConfig {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxOperation {
+    Add,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionRequest {
+    pub operation: SandboxOperation,
+    pub left: i32,
+    pub right: i32,
+}
 
 pub struct SandboxExecutor {
     config: SandboxConfig,
@@ -30,6 +40,11 @@ pub struct SandboxExecutor {
 impl SandboxExecutor {
     pub fn new(config: SandboxConfig) -> Self {
         Self { config }
+    }
+    pub fn execute(&self, request: ExecutionRequest) -> Result<i32, String> {
+        match request.operation {
+            SandboxOperation::Add => self.run_addition(request.left, request.right),
+        }
     }
 
     #[cfg(test)]
@@ -272,9 +287,11 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 mod tests {
 
     use super::{
-        SandboxConfig, SandboxExecutor, run_addition, run_infinite_loop_with_epoch_timeout,
-        run_infinite_loop_with_fuel, run_memory_growth_with_limit,
+        ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation, run_addition,
+        run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
+        run_memory_growth_with_limit,
     };
+
     use std::time::Duration;
     #[test]
     fn blocks_wasm_memory_growth_beyond_limit() {
@@ -335,5 +352,31 @@ mod tests {
         assert_eq!(executor.config().fuel_limit, 5_000);
         assert_eq!(executor.config().memory_limit_bytes, 1024 * 1024);
         assert_eq!(executor.config().timeout, Duration::from_millis(100));
+    }
+    #[test]
+    fn executor_handles_add_request() -> Result<(), String> {
+        let executor = SandboxExecutor::new(SandboxConfig::default());
+
+        let result = executor.execute(ExecutionRequest {
+            operation: SandboxOperation::Add,
+            left: 7,
+            right: 5,
+        })?;
+
+        assert_eq!(result, 12);
+
+        Ok(())
+    }
+    #[test]
+    fn execution_request_preserves_values() {
+        let request = ExecutionRequest {
+            operation: SandboxOperation::Add,
+            left: -4,
+            right: 9,
+        };
+
+        assert_eq!(request.operation, SandboxOperation::Add);
+        assert_eq!(request.left, -4);
+        assert_eq!(request.right, 9);
     }
 }
