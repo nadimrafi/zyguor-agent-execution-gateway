@@ -164,8 +164,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod gateway_tests {
 
+    
+    use super::{
+    AddArgumentsParams, ExecuteParams, ExecutionContextParams, SandboxOperation,
+    build_execution_request,
+};
     use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit, run_infinite_loop_with_fuel};
 
+    #[test]
+    fn builds_add_execution_request() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "add".to_owned(),
+            arguments: AddArgumentsParams { left: 8, right: 4 },
+            context: ExecutionContextParams {
+                purpose: "test addition".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(request.operation, SandboxOperation::Add);
+        assert_eq!(request.arguments.left, 8);
+        assert_eq!(request.arguments.right, 4);
+
+        Ok(())
+    }
+    #[test]
+    fn normalizes_add_operation() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "  ADD  ".to_owned(),
+            arguments: AddArgumentsParams { left: 3, right: 6 },
+            context: ExecutionContextParams {
+                purpose: "test normalized operation".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(request.operation, SandboxOperation::Add);
+        assert_eq!(request.arguments.left, 3);
+        assert_eq!(request.arguments.right, 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_operation() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "delete".to_owned(),
+            arguments: AddArgumentsParams { left: 1, right: 2 },
+            context: ExecutionContextParams {
+                purpose: "unsupported operation test".to_owned(),
+            },
+        };
+
+        let error = build_execution_request(&params)
+            .err()
+            .ok_or_else(|| "expected unsupported operation error".to_owned())?;
+
+        assert_eq!(error, "unsupported operation: delete");
+
+        Ok(())
+    }
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
         Ok(())
     }
