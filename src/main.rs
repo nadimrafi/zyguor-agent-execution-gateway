@@ -2,7 +2,7 @@ mod audit;
 mod policy;
 mod sandbox;
 use audit::{AuditRecord, ExecutionOutcome, persist_audit};
-use policy::evaluate_message;
+use policy::{PolicyDecision, evaluate_message};
 use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
 
 #[cfg(test)]
@@ -30,6 +30,11 @@ struct ExecuteParams {
     context: ExecutionContextParams,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct ExecutionResult {
+    value: i32,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct GatewayResponse<'a> {
     request_id: uuid::Uuid,
@@ -37,7 +42,7 @@ struct GatewayResponse<'a> {
     decision: policy::PolicyDecision,
     reason: policy::PolicyReason,
     executed: bool,
-    message: Option<&'a str>,
+    result: Option<ExecutionResult>,
     execution_outcome: ExecutionOutcome,
 }
 
@@ -73,21 +78,23 @@ where
 
     let evaluation = evaluate_message(message);
 
-    let (status, executed, response_message, execution_outcome) = match evaluation.decision {
-        policy::PolicyDecision::Allow => match sandbox_runner() {
-            Ok(_) => ("executed", true, Some(message), ExecutionOutcome::Success),
-
+    let (status, executed, result, execution_outcome) = match evaluation.decision {
+        PolicyDecision::Allow => match sandbox_runner() {
+            Ok(value) => (
+                "executed",
+                true,
+                Some(ExecutionResult { value }),
+                ExecutionOutcome::Success,
+            ),
             Err(_) => ("execution_failed", false, None, ExecutionOutcome::Failed),
         },
-
-        policy::PolicyDecision::Review => (
+        PolicyDecision::Review => (
             "held_for_review",
             false,
             None,
             ExecutionOutcome::NotExecuted,
         ),
-
-        policy::PolicyDecision::Block => ("blocked", false, None, ExecutionOutcome::NotExecuted),
+        PolicyDecision::Block => ("blocked", false, None, ExecutionOutcome::NotExecuted),
     };
 
     let audit_record = AuditRecord::new(
@@ -106,7 +113,7 @@ where
         decision: evaluation.decision,
         reason: evaluation.reason,
         executed,
-        message: response_message,
+        result,
         execution_outcome,
     };
 
@@ -186,18 +193,18 @@ mod gateway_tests {
 
     #[test]
     fn allow_executes_message() -> Result<(), String> {
-        let result =
-            execute_message_with_audit("read the project status", no_op_audit, sandbox_success)?;
+        let result = execute_message_with_audit("read the project status", no_op_audit, || Ok(5))?;
 
-        let json: serde_json::Value = serde_json::from_str(&result)
-            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).map_err(|error| error.to_string())?;
 
-        assert_eq!(json["status"], "executed");
-        assert_eq!(json["decision"], "Allow");
-        assert_eq!(json["reason"], "Safe");
-        assert_eq!(json["executed"], true);
-        assert_eq!(json["execution_outcome"], "Success");
-        assert_eq!(json["message"], "read the project status");
+        assert_eq!(parsed["status"], "executed");
+        assert_eq!(parsed["decision"], "Allow");
+        assert_eq!(parsed["reason"], "Safe");
+        assert_eq!(parsed["executed"], true);
+        assert_eq!(parsed["execution_outcome"], "Success");
+        assert_eq!(parsed["result"]["value"], 5);
+        assert!(parsed.get("message").is_none());
 
         Ok(())
     }
