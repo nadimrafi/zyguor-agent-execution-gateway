@@ -13,8 +13,21 @@ use rmcp::{
 };
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct EchoParams {
-    message: String,
+struct AddArgumentsParams {
+    left: i32,
+    right: i32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExecutionContextParams {
+    purpose: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExecuteParams {
+    operation: String,
+    arguments: AddArgumentsParams,
+    context: ExecutionContextParams,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -101,21 +114,31 @@ where
         .map_err(|error| format!("failed to serialize gateway response: {error}"))
 }
 
-fn execute_message(message: &str) -> Result<String, String> {
+fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, String> {
+    match params.operation.trim().to_ascii_lowercase().as_str() {
+        "add" => Ok(ExecutionRequest {
+            operation: SandboxOperation::Add,
+            arguments: AddArguments {
+                left: params.arguments.left,
+                right: params.arguments.right,
+            },
+        }),
+        other => Err(format!("unsupported operation: {other}")),
+    }
+}
+fn execute_request(params: &ExecuteParams) -> Result<String, String> {
+    let request = build_execution_request(params)?;
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
-    execute_message_with_audit(message, persist_audit, || {
-        executor.execute(ExecutionRequest {
-            operation: SandboxOperation::Add,
-            arguments: AddArguments { left: 2, right: 3 },
-        })
+    execute_message_with_audit(&params.context.purpose, persist_audit, || {
+        executor.execute(request)
     })
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
     #[tool(description = "Evaluates a message through Zyguor policy controls")]
-    fn echo(&self, Parameters(params): Parameters<EchoParams>) -> String {
-        match execute_message(&params.message) {
+    fn echo(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
+        match execute_request(&params) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
         }
