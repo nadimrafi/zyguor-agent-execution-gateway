@@ -3,7 +3,7 @@ mod policy;
 mod sandbox;
 use audit::{AuditRecord, ExecutionOutcome, persist_audit};
 use policy::evaluate_message;
-use sandbox::{ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
+use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -107,8 +107,7 @@ fn execute_message(message: &str) -> Result<String, String> {
     execute_message_with_audit(message, persist_audit, || {
         executor.execute(ExecutionRequest {
             operation: SandboxOperation::Add,
-            left: 2,
-            right: 3,
+            arguments: AddArguments { left: 2, right: 3 },
         })
     })
 }

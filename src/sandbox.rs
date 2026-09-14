@@ -26,11 +26,17 @@ impl Default for SandboxConfig {
 pub enum SandboxOperation {
     Add,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct AddArguments {
+    pub left: i32,
+    pub right: i32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionRequest {
     pub operation: SandboxOperation,
-    pub left: i32,
-    pub right: i32,
+    pub arguments: AddArguments,
 }
 
 pub struct SandboxExecutor {
@@ -43,7 +49,9 @@ impl SandboxExecutor {
     }
     pub fn execute(&self, request: ExecutionRequest) -> Result<i32, String> {
         match request.operation {
-            SandboxOperation::Add => self.run_addition(request.left, request.right),
+            SandboxOperation::Add => {
+                self.run_addition(request.arguments.left, request.arguments.right)
+            }
         }
     }
 
@@ -287,8 +295,8 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 mod tests {
 
     use super::{
-        ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation, run_addition,
-        run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
+        AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation,
+        run_addition, run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
         run_memory_growth_with_limit,
     };
 
@@ -359,8 +367,7 @@ mod tests {
 
         let result = executor.execute(ExecutionRequest {
             operation: SandboxOperation::Add,
-            left: 7,
-            right: 5,
+            arguments: AddArguments { left: 7, right: 5 },
         })?;
 
         assert_eq!(result, 12);
@@ -371,12 +378,11 @@ mod tests {
     fn execution_request_preserves_values() {
         let request = ExecutionRequest {
             operation: SandboxOperation::Add,
-            left: -4,
-            right: 9,
+            arguments: AddArguments { left: -4, right: 9 },
         };
 
         assert_eq!(request.operation, SandboxOperation::Add);
-        assert_eq!(request.left, -4);
-        assert_eq!(request.right, 9);
+        assert_eq!(request.arguments.left, -4);
+        assert_eq!(request.arguments.right, 9);
     }
 }
