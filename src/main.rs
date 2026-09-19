@@ -143,8 +143,10 @@ fn execute_request(params: &ExecuteParams) -> Result<String, String> {
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
-    #[tool(description = "Evaluates a message through Zyguor policy controls")]
-    fn echo(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
+    #[tool(
+        description = "Evaluates and executes a structured through Zyguor policy-controlled wastime sandbox."
+    )]
+    fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
         match execute_request(&params) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
@@ -164,11 +166,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod gateway_tests {
 
-    
     use super::{
-    AddArgumentsParams, ExecuteParams, ExecutionContextParams, SandboxOperation,
-    build_execution_request,
-};
+        AddArgumentsParams, ExecuteParams, ExecutionContextParams, SandboxOperation,
+        build_execution_request,
+    };
     use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit, run_infinite_loop_with_fuel};
 
     #[test]
