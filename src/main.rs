@@ -2,7 +2,7 @@ mod audit;
 mod policy;
 mod sandbox;
 use audit::{AuditRecord, ExecutionOutcome, persist_audit};
-use policy::{PolicyDecision, evaluate_message};
+use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
 use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
 
 #[cfg(test)]
@@ -67,6 +67,7 @@ fn validate_message(message: &str) -> Result<(), String> {
 
 fn execute_message_with_audit<F, S>(
     message: &str,
+    evaluation: PolicyEvaluation,
     audit_writer: F,
     sandbox_runner: S,
 ) -> Result<String, String>
@@ -75,8 +76,6 @@ where
     S: FnOnce() -> Result<i32, String>,
 {
     validate_message(message)?;
-
-    let evaluation = evaluate_message(message);
 
     let (status, executed, result, execution_outcome) = match evaluation.decision {
         PolicyDecision::Allow => match sandbox_runner() {
@@ -133,18 +132,26 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
         other => Err(format!("unsupported operation: {other}")),
     }
 }
+fn policy_operation_for(operation: SandboxOperation) -> PolicyOperation {
+    match operation {
+        SandboxOperation::Add => PolicyOperation::Add,
+    }
+}
+
 fn execute_request(params: &ExecuteParams) -> Result<String, String> {
     let request = build_execution_request(params)?;
+    let policy_operation = policy_operation_for(request.operation);
+    let evaluation = evaluate_operation(policy_operation);
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
-    execute_message_with_audit(&params.context.purpose, persist_audit, || {
+    execute_message_with_audit(&params.context.purpose, evaluation, persist_audit, || {
         executor.execute(request)
     })
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
     #[tool(
-        description = "Evaluates and executes a structured through Zyguor policy-controlled wastime sandbox."
+        description = "Evaluates and executes a structured request through the Zyguor policy-controlled wastime sandbox."
     )]
     fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
         match execute_request(&params) {
@@ -165,12 +172,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod gateway_tests {
-
     use super::{
-        AddArgumentsParams, ExecuteParams, ExecutionContextParams, SandboxOperation,
-        build_execution_request,
+        AddArgumentsParams, ExecuteParams, ExecutionContextParams, MAX_MESSAGE_LENGTH,
+        PolicyEvaluation, PolicyOperation, SandboxOperation, build_execution_request,
+        execute_message_with_audit, execute_request, policy_operation_for,
+        run_infinite_loop_with_fuel,
     };
-    use super::{MAX_MESSAGE_LENGTH, execute_message_with_audit, run_infinite_loop_with_fuel};
+    use crate::policy::evaluate_message;
+
+    fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn evaluation_for(message: &str) -> PolicyEvaluation {
+        evaluate_message(message)
+    }
+
+    fn sandbox_success() -> Result<i32, String> {
+        Ok(5)
+    }
+
+    fn sandbox_real_fuel_failure() -> Result<i32, String> {
+        run_infinite_loop_with_fuel(1_000)?;
+        Ok(0)
+    }
+
+    fn sandbox_failure() -> Result<i32, String> {
+        Err("simulated sandbox failure".to_owned())
+    }
+
+    fn sandbox_must_not_run() -> Result<i32, String> {
+        Err("sandbox was called unexpectedly".to_owned())
+    }
+
+    fn capture_failed_audit(record: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
+        assert_eq!(record.decision, crate::policy::PolicyDecision::Allow);
+        assert_eq!(
+            record.execution_outcome,
+            crate::audit::ExecutionOutcome::Failed
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn builds_add_execution_request() -> Result<(), String> {
@@ -190,6 +233,15 @@ mod gateway_tests {
 
         Ok(())
     }
+
+    #[test]
+    fn maps_add_to_add_policy_operation() {
+        assert_eq!(
+            policy_operation_for(SandboxOperation::Add),
+            PolicyOperation::Add
+        );
+    }
+
     #[test]
     fn normalizes_add_operation() -> Result<(), String> {
         let params = ExecuteParams {
@@ -227,34 +279,13 @@ mod gateway_tests {
 
         Ok(())
     }
-    fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn sandbox_success() -> Result<i32, String> {
-        Ok(5)
-    }
-    fn sandbox_real_fuel_failure() -> Result<i32, String> {
-        run_infinite_loop_with_fuel(1_000)?;
-        Ok(0)
-    }
-
-    fn sandbox_failure() -> Result<i32, String> {
-        Err("simulated sandbox failure".to_owned())
-    }
-    fn capture_failed_audit(record: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
-        assert_eq!(record.decision, crate::policy::PolicyDecision::Allow);
-        assert_eq!(
-            record.execution_outcome,
-            crate::audit::ExecutionOutcome::Failed
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn allow_executes_message() -> Result<(), String> {
-        let result = execute_message_with_audit("read the project status", no_op_audit, || Ok(5))?;
+        let message = "read the project status";
+
+        let result =
+            execute_message_with_audit(message, evaluation_for(message), no_op_audit, || Ok(5))?;
 
         let parsed: serde_json::Value =
             serde_json::from_str(&result).map_err(|error| error.to_string())?;
@@ -272,8 +303,14 @@ mod gateway_tests {
 
     #[test]
     fn review_does_not_execute_message() -> Result<(), String> {
-        let result =
-            execute_message_with_audit("write a new configuration", no_op_audit, sandbox_success)?;
+        let message = "write a new configuration";
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            no_op_audit,
+            sandbox_success,
+        )?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -283,15 +320,19 @@ mod gateway_tests {
         assert_eq!(json["reason"], "Write");
         assert_eq!(json["executed"], false);
         assert_eq!(json["execution_outcome"], "NotExecuted");
-        assert!(json["message"].is_null());
+        assert!(json["result"].is_null());
+        assert!(json.get("message").is_none());
 
         Ok(())
     }
 
     #[test]
     fn block_does_not_execute_message() -> Result<(), String> {
+        let message = "delete the production database";
+
         let result = execute_message_with_audit(
-            "delete the production database",
+            message,
+            evaluation_for(message),
             no_op_audit,
             sandbox_success,
         )?;
@@ -304,15 +345,22 @@ mod gateway_tests {
         assert_eq!(json["reason"], "Destructive");
         assert_eq!(json["executed"], false);
         assert_eq!(json["execution_outcome"], "NotExecuted");
-        assert!(json["message"].is_null());
+        assert!(json["result"].is_null());
+        assert!(json.get("message").is_none());
 
         Ok(())
     }
 
     #[test]
     fn allow_reports_sandbox_failure() -> Result<(), String> {
-        let result =
-            execute_message_with_audit("read the project status", no_op_audit, sandbox_failure)?;
+        let message = "read the project status";
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            no_op_audit,
+            sandbox_failure,
+        )?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -322,46 +370,68 @@ mod gateway_tests {
         assert_eq!(json["reason"], "Safe");
         assert_eq!(json["executed"], false);
         assert_eq!(json["execution_outcome"], "Failed");
-        assert!(json["message"].is_null());
+        assert!(json["result"].is_null());
+        assert!(json.get("message").is_none());
 
         Ok(())
     }
 
     #[test]
     fn rejects_empty_message() {
-        let result = execute_message_with_audit("", no_op_audit, sandbox_success);
+        let message = "";
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            no_op_audit,
+            sandbox_success,
+        );
 
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_whitespace_only_message() {
-        let result = execute_message_with_audit("   ", no_op_audit, sandbox_success);
+        let message = "   ";
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            no_op_audit,
+            sandbox_success,
+        );
 
         assert!(result.is_err());
-    }
-    fn sandbox_must_not_run() -> Result<i32, String> {
-        Err("sandbox was called unexpectedly".to_owned())
     }
 
     #[test]
     fn accepts_message_at_maximum_length() -> Result<(), String> {
         let message = "a".repeat(MAX_MESSAGE_LENGTH);
 
-        let result = execute_message_with_audit(&message, no_op_audit, sandbox_success)?;
+        let result = execute_message_with_audit(
+            &message,
+            evaluation_for(&message),
+            no_op_audit,
+            sandbox_success,
+        )?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
 
         assert_eq!(json["executed"], true);
         assert_eq!(json["execution_outcome"], "Success");
+        assert_eq!(json["result"]["value"], 5);
 
         Ok(())
     }
+
     #[test]
     fn review_never_calls_sandbox() -> Result<(), String> {
+        let message = "write a new configuration";
+
         let result = execute_message_with_audit(
-            "write a new configuration",
+            message,
+            evaluation_for(message),
             no_op_audit,
             sandbox_must_not_run,
         )?;
@@ -371,14 +441,18 @@ mod gateway_tests {
 
         assert_eq!(json["decision"], "Review");
         assert_eq!(json["execution_outcome"], "NotExecuted");
+        assert!(json["result"].is_null());
 
         Ok(())
     }
 
     #[test]
     fn block_never_calls_sandbox() -> Result<(), String> {
+        let message = "delete the production database";
+
         let result = execute_message_with_audit(
-            "delete the production database",
+            message,
+            evaluation_for(message),
             no_op_audit,
             sandbox_must_not_run,
         )?;
@@ -388,14 +462,18 @@ mod gateway_tests {
 
         assert_eq!(json["decision"], "Block");
         assert_eq!(json["execution_outcome"], "NotExecuted");
+        assert!(json["result"].is_null());
 
         Ok(())
     }
 
     #[test]
     fn real_wasmtime_resource_failure_is_reported() -> Result<(), String> {
+        let message = "read the project status";
+
         let result = execute_message_with_audit(
-            "read the project status",
+            message,
+            evaluation_for(message),
             no_op_audit,
             sandbox_real_fuel_failure,
         )?;
@@ -408,14 +486,19 @@ mod gateway_tests {
         assert_eq!(json["reason"], "Safe");
         assert_eq!(json["executed"], false);
         assert_eq!(json["execution_outcome"], "Failed");
-        assert!(json["message"].is_null());
+        assert!(json["result"].is_null());
+        assert!(json.get("message").is_none());
 
         Ok(())
     }
+
     #[test]
     fn real_wasmtime_failure_is_recorded_in_audit() -> Result<(), String> {
+        let message = "read the project status";
+
         let result = execute_message_with_audit(
-            "read the project status",
+            message,
+            evaluation_for(message),
             capture_failed_audit,
             sandbox_real_fuel_failure,
         )?;
@@ -426,6 +509,7 @@ mod gateway_tests {
         assert_eq!(json["status"], "execution_failed");
         assert_eq!(json["execution_outcome"], "Failed");
         assert_eq!(json["executed"], false);
+        assert!(json["result"].is_null());
 
         Ok(())
     }
@@ -434,8 +518,37 @@ mod gateway_tests {
     fn rejects_message_over_maximum_length() {
         let message = "a".repeat(MAX_MESSAGE_LENGTH + 1);
 
-        let result = execute_message_with_audit(&message, no_op_audit, sandbox_success);
+        let result = execute_message_with_audit(
+            &message,
+            evaluation_for(&message),
+            no_op_audit,
+            sandbox_success,
+        );
 
         assert!(result.is_err());
+    }
+    #[test]
+    fn structured_operation_policy_overrides_purpose_text() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "add".to_owned(),
+            arguments: AddArgumentsParams { left: 2, right: 3 },
+            context: ExecutionContextParams {
+                purpose: "delete the production database".to_owned(),
+            },
+        };
+
+        let result = execute_request(&params)?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["result"]["value"], 5);
+        assert_eq!(json["execution_outcome"], "Success");
+
+        Ok(())
     }
 }

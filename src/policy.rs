@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[allow(dead_code)]
 pub enum PolicyDecision {
     Allow,
     Review,
@@ -6,6 +7,7 @@ pub enum PolicyDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[allow(dead_code)]
 pub enum PolicyReason {
     Safe,
     Write,
@@ -18,6 +20,21 @@ pub struct PolicyEvaluation {
     pub reason: PolicyReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyOperation {
+    Add,
+}
+
+pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
+    match operation {
+        PolicyOperation::Add => PolicyEvaluation {
+            decision: PolicyDecision::Allow,
+            reason: PolicyReason::Safe,
+        },
+    }
+}
+
+#[cfg(test)]
 pub fn evaluate_message(message: &str) -> PolicyEvaluation {
     let normalized = message.trim().to_lowercase();
 
@@ -47,7 +64,17 @@ pub fn evaluate_message(message: &str) -> PolicyEvaluation {
 
 #[cfg(test)]
 mod tests {
-    use super::{PolicyDecision, PolicyReason, evaluate_message};
+    use super::{
+        PolicyDecision, PolicyOperation, PolicyReason, evaluate_message, evaluate_operation,
+    };
+
+    #[test]
+    fn allows_add_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::Add);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
 
     #[test]
     fn allows_safe_message() {
@@ -72,6 +99,7 @@ mod tests {
         assert_eq!(evaluation.decision, PolicyDecision::Block);
         assert_eq!(evaluation.reason, PolicyReason::Destructive);
     }
+
     #[test]
     fn block_is_case_insensitive() {
         let evaluation = evaluate_message("DELETE the production database");
@@ -90,9 +118,9 @@ mod tests {
 
     #[test]
     fn trims_surrounding_whitespace() {
-        let evaluation = evaluate_message("   delete the production database   ");
+        let evaluation = evaluate_message("   read the project status   ");
 
-        assert_eq!(evaluation.decision, PolicyDecision::Block);
-        assert_eq!(evaluation.reason, PolicyReason::Destructive);
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
     }
 }
