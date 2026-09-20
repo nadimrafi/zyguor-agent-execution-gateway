@@ -3,7 +3,7 @@ mod policy;
 mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
-use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
+use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -151,25 +151,22 @@ where
 
 fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, String> {
     match params.operation.trim().to_ascii_lowercase().as_str() {
-        "add" => Ok(ExecutionRequest {
-            operation: SandboxOperation::Add,
-            arguments: AddArguments {
-                left: params.arguments.left,
-                right: params.arguments.right,
-            },
-        }),
+        "add" => Ok(ExecutionRequest::Add(AddArguments {
+            left: params.arguments.left,
+            right: params.arguments.right,
+        })),
         other => Err(format!("unsupported operation: {other}")),
     }
 }
-fn policy_operation_for(operation: SandboxOperation) -> PolicyOperation {
-    match operation {
-        SandboxOperation::Add => PolicyOperation::Add,
+fn policy_operation_for(request: &ExecutionRequest) -> PolicyOperation {
+    match request {
+        ExecutionRequest::Add(_) => PolicyOperation::Add,
     }
 }
 
 fn execute_request(params: &ExecuteParams) -> Result<String, String> {
     let request = build_execution_request(params)?;
-    let policy_operation = policy_operation_for(request.operation);
+    let policy_operation = policy_operation_for(&request);
     let evaluation = evaluate_operation(policy_operation);
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
@@ -202,8 +199,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod gateway_tests {
     use super::{
-        AddArgumentsParams, ExecuteParams, ExecutionContextParams, MAX_MESSAGE_LENGTH,
-        PolicyEvaluation, PolicyOperation, SandboxOperation, build_execution_request,
+        AddArguments, AddArgumentsParams, ExecuteParams, ExecutionContextParams, ExecutionRequest,
+        MAX_MESSAGE_LENGTH, PolicyEvaluation, PolicyOperation, build_execution_request,
         execute_message_with_audit, execute_request, policy_operation_for,
         run_infinite_loop_with_fuel,
     };
@@ -246,19 +243,21 @@ mod gateway_tests {
 
         let request = build_execution_request(&params)?;
 
-        assert_eq!(request.operation, SandboxOperation::Add);
-        assert_eq!(request.arguments.left, 8);
-        assert_eq!(request.arguments.right, 4);
+        match request {
+            ExecutionRequest::Add(arguments) => {
+                assert_eq!(arguments.left, 8);
+                assert_eq!(arguments.right, 4);
+            }
+        }
 
         Ok(())
     }
 
     #[test]
     fn maps_add_to_add_policy_operation() {
-        assert_eq!(
-            policy_operation_for(SandboxOperation::Add),
-            PolicyOperation::Add
-        );
+        let request = ExecutionRequest::Add(AddArguments { left: 2, right: 3 });
+
+        assert_eq!(policy_operation_for(&request), PolicyOperation::Add);
     }
 
     #[test]
@@ -273,9 +272,12 @@ mod gateway_tests {
 
         let request = build_execution_request(&params)?;
 
-        assert_eq!(request.operation, SandboxOperation::Add);
-        assert_eq!(request.arguments.left, 3);
-        assert_eq!(request.arguments.right, 6);
+        match request {
+            ExecutionRequest::Add(arguments) => {
+                assert_eq!(arguments.left, 3);
+                assert_eq!(arguments.right, 6);
+            }
+        }
 
         Ok(())
     }

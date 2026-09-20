@@ -22,10 +22,6 @@ impl Default for SandboxConfig {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxOperation {
-    Add,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AddArguments {
@@ -34,9 +30,8 @@ pub struct AddArguments {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ExecutionRequest {
-    pub operation: SandboxOperation,
-    pub arguments: AddArguments,
+pub enum ExecutionRequest {
+    Add(AddArguments),
 }
 
 pub struct SandboxExecutor {
@@ -48,10 +43,8 @@ impl SandboxExecutor {
         Self { config }
     }
     pub fn execute(&self, request: ExecutionRequest) -> Result<i32, String> {
-        match request.operation {
-            SandboxOperation::Add => {
-                self.run_addition(request.arguments.left, request.arguments.right)
-            }
+        match request {
+            ExecutionRequest::Add(arguments) => self.run_addition(arguments.left, arguments.right),
         }
     }
 
@@ -295,8 +288,8 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 mod tests {
 
     use super::{
-        AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation,
-        run_addition, run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
+        AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, run_addition,
+        run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
         run_memory_growth_with_limit,
     };
 
@@ -365,10 +358,7 @@ mod tests {
     fn executor_handles_add_request() -> Result<(), String> {
         let executor = SandboxExecutor::new(SandboxConfig::default());
 
-        let result = executor.execute(ExecutionRequest {
-            operation: SandboxOperation::Add,
-            arguments: AddArguments { left: 7, right: 5 },
-        })?;
+        let result = executor.execute(ExecutionRequest::Add(AddArguments { left: 7, right: 5 }))?;
 
         assert_eq!(result, 12);
 
@@ -376,13 +366,13 @@ mod tests {
     }
     #[test]
     fn execution_request_preserves_values() {
-        let request = ExecutionRequest {
-            operation: SandboxOperation::Add,
-            arguments: AddArguments { left: -4, right: 9 },
-        };
+        let request = ExecutionRequest::Add(AddArguments { left: -4, right: 9 });
 
-        assert_eq!(request.operation, SandboxOperation::Add);
-        assert_eq!(request.arguments.left, -4);
-        assert_eq!(request.arguments.right, 9);
+        match request {
+            ExecutionRequest::Add(arguments) => {
+                assert_eq!(arguments.left, -4);
+                assert_eq!(arguments.right, 9);
+            }
+        }
     }
 }
