@@ -5,6 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AuditPhase {
+    PreExecution,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ExecutionOutcome {
     Success,
     Failed,
@@ -16,6 +22,7 @@ pub struct AuditRecord<'a> {
     pub request_id: Uuid,
     pub timestamp_unix: u64,
     pub message: &'a str,
+    pub phase: AuditPhase,
     pub decision: PolicyDecision,
     pub reason: PolicyReason,
     pub execution_outcome: ExecutionOutcome,
@@ -23,14 +30,14 @@ pub struct AuditRecord<'a> {
 
 impl<'a> AuditRecord<'a> {
     pub fn new(
+        request_id: Uuid,
         message: &'a str,
         decision: PolicyDecision,
         reason: PolicyReason,
+        phase: AuditPhase,
         execution_outcome: ExecutionOutcome,
     ) -> Result<Self, std::time::SystemTimeError> {
         let timestamp_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-        let request_id = Uuid::new_v4();
 
         Ok(Self {
             request_id,
@@ -39,6 +46,7 @@ impl<'a> AuditRecord<'a> {
             decision,
             reason,
             execution_outcome,
+            phase,
         })
     }
 }
@@ -64,15 +72,19 @@ pub fn persist_audit(record: &AuditRecord<'_>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuditRecord, ExecutionOutcome, write_audit};
+    use super::{AuditPhase, AuditRecord, ExecutionOutcome, write_audit};
     use crate::policy::{PolicyDecision, PolicyReason};
+    use uuid::Uuid;
 
     #[test]
     fn writes_one_json_record_per_line() -> Result<(), String> {
+        let request_id = Uuid::new_v4();
         let record = AuditRecord::new(
+            request_id,
             "read project status",
             PolicyDecision::Allow,
             PolicyReason::Safe,
+            AuditPhase::Completion,
             ExecutionOutcome::Success,
         )
         .map_err(|error| format!("failed to create test audit record: {error}"))?;

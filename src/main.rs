@@ -1,7 +1,7 @@
 mod audit;
 mod policy;
 mod sandbox;
-use audit::{AuditRecord, ExecutionOutcome, persist_audit};
+use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
 use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, SandboxOperation};
 
@@ -68,25 +68,42 @@ fn validate_message(message: &str) -> Result<(), String> {
 fn execute_message_with_audit<F, S>(
     message: &str,
     evaluation: PolicyEvaluation,
-    audit_writer: F,
+    mut audit_writer: F,
     sandbox_runner: S,
 ) -> Result<String, String>
 where
-    F: FnOnce(&AuditRecord<'_>) -> Result<(), String>,
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
     S: FnOnce() -> Result<i32, String>,
 {
     validate_message(message)?;
 
+    let request_id = uuid::Uuid::new_v4();
+
     let (status, executed, result, execution_outcome) = match evaluation.decision {
-        PolicyDecision::Allow => match sandbox_runner() {
-            Ok(value) => (
-                "executed",
-                true,
-                Some(ExecutionResult { value }),
-                ExecutionOutcome::Success,
-            ),
-            Err(_) => ("execution_failed", false, None, ExecutionOutcome::Failed),
-        },
+        PolicyDecision::Allow => {
+            let pre_execution_record = AuditRecord::new(
+                request_id,
+                message,
+                evaluation.decision,
+                evaluation.reason,
+                AuditPhase::PreExecution,
+                ExecutionOutcome::NotExecuted,
+            )
+            .map_err(|error| format!("failed to create pre-execution audit record: {error}"))?;
+
+            audit_writer(&pre_execution_record)
+                .map_err(|error| format!("failed to persist pre-execution audit: {error}"))?;
+
+            match sandbox_runner() {
+                Ok(value) => (
+                    "executed",
+                    true,
+                    Some(ExecutionResult { value }),
+                    ExecutionOutcome::Success,
+                ),
+                Err(_) => ("execution_failed", false, None, ExecutionOutcome::Failed),
+            }
+        }
         PolicyDecision::Review => (
             "held_for_review",
             false,
@@ -97,9 +114,11 @@ where
     };
 
     let audit_record = AuditRecord::new(
+        request_id,
         message,
         evaluation.decision,
         evaluation.reason,
+        AuditPhase::Completion,
         execution_outcome,
     )
     .map_err(|error| format!("failed to create audit record: {error}"))?;
@@ -203,16 +222,6 @@ mod gateway_tests {
 
     fn sandbox_must_not_run() -> Result<i32, String> {
         Err("sandbox was called unexpectedly".to_owned())
-    }
-
-    fn capture_failed_audit(record: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
-        assert_eq!(record.decision, crate::policy::PolicyDecision::Allow);
-        assert_eq!(
-            record.execution_outcome,
-            crate::audit::ExecutionOutcome::Failed
-        );
-
-        Ok(())
     }
 
     #[test]
@@ -495,11 +504,15 @@ mod gateway_tests {
     #[test]
     fn real_wasmtime_failure_is_recorded_in_audit() -> Result<(), String> {
         let message = "read the project status";
+        let mut audit_records = Vec::new();
 
         let result = execute_message_with_audit(
             message,
             evaluation_for(message),
-            capture_failed_audit,
+            |record| {
+                audit_records.push((record.request_id, record.phase, record.execution_outcome));
+                Ok(())
+            },
             sandbox_real_fuel_failure,
         )?;
 
@@ -510,6 +523,19 @@ mod gateway_tests {
         assert_eq!(json["execution_outcome"], "Failed");
         assert_eq!(json["executed"], false);
         assert!(json["result"].is_null());
+
+        assert_eq!(audit_records.len(), 2);
+
+        assert_eq!(audit_records[0].1, crate::audit::AuditPhase::PreExecution);
+        assert_eq!(
+            audit_records[0].2,
+            crate::audit::ExecutionOutcome::NotExecuted
+        );
+
+        assert_eq!(audit_records[1].1, crate::audit::AuditPhase::Completion);
+        assert_eq!(audit_records[1].2, crate::audit::ExecutionOutcome::Failed);
+
+        assert_eq!(audit_records[0].0, audit_records[1].0);
 
         Ok(())
     }
@@ -548,6 +574,26 @@ mod gateway_tests {
         assert_eq!(json["executed"], true);
         assert_eq!(json["result"]["value"], 5);
         assert_eq!(json["execution_outcome"], "Success");
+
+        Ok(())
+    }
+
+    #[test]
+    fn audit_failure_prevents_sandbox_execution() -> Result<(), String> {
+        let message = "read the project status";
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            |_| Err("simulated audit failure".to_owned()),
+            sandbox_must_not_run,
+        );
+
+        let error = result
+            .err()
+            .ok_or_else(|| "expected pre-execution audit failure".to_owned())?;
+
+        assert!(error.contains("failed to persist pre-execution audit"));
 
         Ok(())
     }
