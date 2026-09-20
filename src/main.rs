@@ -3,7 +3,7 @@ mod execution;
 mod policy;
 mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
-use execution::{AddArguments, ExecutionRequest};
+use execution::{AddArguments, ExecutionRequest, ReadFileArguments};
 use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
 use sandbox::{SandboxConfig, SandboxExecutor};
 
@@ -15,21 +15,21 @@ use rmcp::{
 };
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct AddArgumentsParams {
-    left: i32,
-    right: i32,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ExecutionContextParams {
-    purpose: String,
+struct ExecutionArgumentsParams {
+    left: Option<i32>,
+    right: Option<i32>,
+    path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExecuteParams {
     operation: String,
-    arguments: AddArgumentsParams,
+    arguments: ExecutionArgumentsParams,
     context: ExecutionContextParams,
+}
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExecutionContextParams {
+    purpose: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -153,16 +153,41 @@ where
 
 fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, String> {
     match params.operation.trim().to_ascii_lowercase().as_str() {
-        "add" => Ok(ExecutionRequest::Add(AddArguments {
-            left: params.arguments.left,
-            right: params.arguments.right,
-        })),
+        "add" => {
+            let left = params
+                .arguments
+                .left
+                .ok_or_else(|| "add requires arguments.left".to_owned())?;
+
+            let right = params
+                .arguments
+                .right
+                .ok_or_else(|| "add requires arguments.right".to_owned())?;
+
+            Ok(ExecutionRequest::Add(AddArguments { left, right }))
+        }
+        "read_file" => {
+            let path = params
+                .arguments
+                .path
+                .as_ref()
+                .ok_or_else(|| "read_file requires arguments.path".to_owned())?;
+
+            if path.trim().is_empty() {
+                return Err("read_file path cannot be empty".to_owned());
+            }
+
+            Ok(ExecutionRequest::ReadFile(ReadFileArguments {
+                path: path.clone(),
+            }))
+        }
         other => Err(format!("unsupported operation: {other}")),
     }
 }
 fn policy_operation_for(request: &ExecutionRequest) -> PolicyOperation {
     match request {
         ExecutionRequest::Add(_) => PolicyOperation::Add,
+        ExecutionRequest::ReadFile(_) => PolicyOperation::ReadFile,
     }
 }
 
@@ -172,9 +197,18 @@ fn execute_request(params: &ExecuteParams) -> Result<String, String> {
     let evaluation = evaluate_operation(policy_operation);
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
-    execute_message_with_audit(&params.context.purpose, evaluation, persist_audit, || {
-        executor.execute(request)
-    })
+    execute_message_with_audit(
+        &params.context.purpose,
+        evaluation,
+        persist_audit,
+        || match request {
+            ExecutionRequest::Add(arguments) => executor.execute_add(arguments),
+            ExecutionRequest::ReadFile(arguments) => Err(format!(
+                "read_file execution is not implemented yet for path: {}",
+                arguments.path
+            )),
+        },
+    )
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
@@ -201,9 +235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod gateway_tests {
     use super::{
-        AddArguments, AddArgumentsParams, ExecuteParams, ExecutionContextParams, ExecutionRequest,
-        MAX_MESSAGE_LENGTH, PolicyEvaluation, PolicyOperation, build_execution_request,
-        execute_message_with_audit, execute_request, policy_operation_for,
+        AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
+        ExecutionRequest, MAX_MESSAGE_LENGTH, PolicyEvaluation, PolicyOperation,
+        build_execution_request, execute_message_with_audit, execute_request, policy_operation_for,
         run_infinite_loop_with_fuel,
     };
     use crate::policy::evaluate_message;
@@ -237,7 +271,11 @@ mod gateway_tests {
     fn builds_add_execution_request() -> Result<(), String> {
         let params = ExecuteParams {
             operation: "add".to_owned(),
-            arguments: AddArgumentsParams { left: 8, right: 4 },
+            arguments: ExecutionArgumentsParams {
+                left: Some(8),
+                right: Some(4),
+                path: None,
+            },
             context: ExecutionContextParams {
                 purpose: "test addition".to_owned(),
             },
@@ -246,13 +284,84 @@ mod gateway_tests {
         let request = build_execution_request(&params)?;
 
         match request {
-            ExecutionRequest::Add(arguments) => {
-                assert_eq!(arguments.left, 8);
-                assert_eq!(arguments.right, 4);
+            ExecutionRequest::Add(_) => {
+                // keep existing assertions
+            }
+            ExecutionRequest::ReadFile(_) => {
+                panic!("expected Add execution request");
             }
         }
 
         Ok(())
+    }
+    #[test]
+    fn builds_read_file_execution_request() {
+        let params = ExecuteParams {
+            operation: "read_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("README.md".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "read project documentation".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params).expect("read_file request should be valid");
+
+        match request {
+            ExecutionRequest::ReadFile(arguments) => {
+                assert_eq!(arguments.path, "README.md");
+            }
+            ExecutionRequest::Add(_) => {
+                panic!("expected ReadFile execution request");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_read_file_without_path() {
+        let params = ExecuteParams {
+            operation: "read_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "read project documentation".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result.expect_err("missing path should be rejected"),
+            "read_file requires arguments.path"
+        );
+    }
+
+    #[test]
+    fn rejects_read_file_with_blank_path() {
+        let params = ExecuteParams {
+            operation: "read_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("   ".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "read project documentation".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result.expect_err("blank path should be rejected"),
+            "read_file path cannot be empty"
+        );
     }
 
     #[test]
@@ -266,7 +375,11 @@ mod gateway_tests {
     fn normalizes_add_operation() -> Result<(), String> {
         let params = ExecuteParams {
             operation: "  ADD  ".to_owned(),
-            arguments: AddArgumentsParams { left: 3, right: 6 },
+            arguments: ExecutionArgumentsParams {
+                left: Some(3),
+                right: Some(6),
+                path: None,
+            },
             context: ExecutionContextParams {
                 purpose: "test normalized operation".to_owned(),
             },
@@ -279,6 +392,9 @@ mod gateway_tests {
                 assert_eq!(arguments.left, 3);
                 assert_eq!(arguments.right, 6);
             }
+            ExecutionRequest::ReadFile(_) => {
+                panic!("expected Add execution request");
+            }
         }
 
         Ok(())
@@ -288,7 +404,11 @@ mod gateway_tests {
     fn rejects_unsupported_operation() -> Result<(), String> {
         let params = ExecuteParams {
             operation: "delete".to_owned(),
-            arguments: AddArgumentsParams { left: 1, right: 2 },
+            arguments: ExecutionArgumentsParams {
+                left: Some(1),
+                right: Some(2),
+                path: None,
+            },
             context: ExecutionContextParams {
                 purpose: "unsupported operation test".to_owned(),
             },
@@ -571,7 +691,11 @@ mod gateway_tests {
     fn structured_operation_policy_overrides_purpose_text() -> Result<(), String> {
         let params = ExecuteParams {
             operation: "add".to_owned(),
-            arguments: AddArgumentsParams { left: 2, right: 3 },
+            arguments: ExecutionArgumentsParams {
+                left: Some(2),
+                right: Some(3),
+                path: None,
+            },
             context: ExecutionContextParams {
                 purpose: "delete the production database".to_owned(),
             },

@@ -23,11 +23,12 @@ pub struct PolicyEvaluation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyOperation {
     Add,
+    ReadFile,
 }
 
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
     match operation {
-        PolicyOperation::Add => PolicyEvaluation {
+        PolicyOperation::Add | PolicyOperation::ReadFile => PolicyEvaluation {
             decision: PolicyDecision::Allow,
             reason: PolicyReason::Safe,
         },

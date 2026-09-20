@@ -1,4 +1,4 @@
-use crate::execution::ExecutionRequest;
+use crate::execution::AddArguments;
 use std::{sync::mpsc, thread, time::Duration};
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -31,10 +31,8 @@ impl SandboxExecutor {
     pub fn new(config: SandboxConfig) -> Self {
         Self { config }
     }
-    pub fn execute(&self, request: ExecutionRequest) -> Result<i32, String> {
-        match request {
-            ExecutionRequest::Add(arguments) => self.run_addition(arguments.left, arguments.right),
-        }
+    pub fn execute_add(&self, arguments: AddArguments) -> Result<i32, String> {
+        self.run_addition(arguments.left, arguments.right)
     }
 
     #[cfg(test)]
@@ -275,7 +273,7 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use crate::execution::{AddArguments, ExecutionRequest};
+    use crate::execution::AddArguments;
 
     use super::{
         SandboxConfig, SandboxExecutor, run_addition, run_infinite_loop_with_epoch_timeout,
@@ -347,21 +345,10 @@ mod tests {
     fn executor_handles_add_request() -> Result<(), String> {
         let executor = SandboxExecutor::new(SandboxConfig::default());
 
-        let result = executor.execute(ExecutionRequest::Add(AddArguments { left: 7, right: 5 }))?;
+        let result = executor.execute_add(AddArguments { left: 7, right: 5 })?;
 
         assert_eq!(result, 12);
 
         Ok(())
-    }
-    #[test]
-    fn execution_request_preserves_values() {
-        let request = ExecutionRequest::Add(AddArguments { left: -4, right: 9 });
-
-        match request {
-            ExecutionRequest::Add(arguments) => {
-                assert_eq!(arguments.left, -4);
-                assert_eq!(arguments.right, 9);
-            }
-        }
     }
 }
