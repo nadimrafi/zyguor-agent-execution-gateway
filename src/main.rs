@@ -123,7 +123,17 @@ where
     )
     .map_err(|error| format!("failed to create audit record: {error}"))?;
 
-    audit_writer(&audit_record)?;
+    let completion_audit_failed = audit_writer(&audit_record).is_err();
+
+    let status = if completion_audit_failed {
+        match execution_outcome {
+            ExecutionOutcome::Success => "execution_completed_audit_failed",
+            ExecutionOutcome::Failed => "execution_failed_audit_failed",
+            ExecutionOutcome::NotExecuted => status,
+        }
+    } else {
+        status
+    };
 
     let response = GatewayResponse {
         request_id: audit_record.request_id,
@@ -170,7 +180,7 @@ fn execute_request(params: &ExecuteParams) -> Result<String, String> {
 #[tool_router(server_handler)]
 impl ZyguorGateway {
     #[tool(
-        description = "Evaluates and executes a structured request through the Zyguor policy-controlled wastime sandbox."
+        description = "Evaluates and executes a structured request through the Zyguor policy-controlled Wasmtime sandbox."
     )]
     fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
         match execute_request(&params) {
@@ -594,6 +604,69 @@ mod gateway_tests {
             .ok_or_else(|| "expected pre-execution audit failure".to_owned())?;
 
         assert!(error.contains("failed to persist pre-execution audit"));
+
+        Ok(())
+    }
+    #[test]
+    fn completion_audit_failure_preserves_successful_execution() -> Result<(), String> {
+        let message = "read the project status";
+        let mut audit_calls = 0;
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            |_| {
+                audit_calls += 1;
+
+                if audit_calls == 2 {
+                    Err("simulated completion audit failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            sandbox_success,
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(audit_calls, 2);
+        assert_eq!(json["status"], "execution_completed_audit_failed");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["execution_outcome"], "Success");
+        assert_eq!(json["result"]["value"], 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn completion_audit_failure_preserves_failed_execution() -> Result<(), String> {
+        let message = "read the project status";
+        let mut audit_calls = 0;
+
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            |_| {
+                audit_calls += 1;
+
+                if audit_calls == 2 {
+                    Err("simulated completion audit failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            sandbox_failure,
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(audit_calls, 2);
+        assert_eq!(json["status"], "execution_failed_audit_failed");
+        assert_eq!(json["executed"], false);
+        assert_eq!(json["execution_outcome"], "Failed");
+        assert!(json["result"].is_null());
 
         Ok(())
     }

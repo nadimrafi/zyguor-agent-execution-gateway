@@ -67,7 +67,12 @@ pub fn persist_audit(record: &AuditRecord<'_>) -> Result<(), String> {
         .open("zyguor-audit.jsonl")
         .map_err(|error| format!("failed to open audit log: {error}"))?;
 
-    write_audit(&mut file, record)
+    write_audit(&mut file, record)?;
+
+    file.sync_data()
+        .map_err(|error| format!("failed to sync audit log: {error}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
