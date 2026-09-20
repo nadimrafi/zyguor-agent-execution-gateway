@@ -1,9 +1,11 @@
 mod audit;
+mod execution;
 mod policy;
 mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
+use execution::{AddArguments, ExecutionRequest};
 use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
-use sandbox::{AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor};
+use sandbox::{SandboxConfig, SandboxExecutor};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;

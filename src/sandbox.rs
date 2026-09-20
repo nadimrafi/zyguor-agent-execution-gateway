@@ -1,5 +1,5 @@
+use crate::execution::ExecutionRequest;
 use std::{sync::mpsc, thread, time::Duration};
-
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 struct SandboxState {
@@ -21,17 +21,6 @@ impl Default for SandboxConfig {
             timeout: Duration::from_millis(250),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AddArguments {
-    pub left: i32,
-    pub right: i32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ExecutionRequest {
-    Add(AddArguments),
 }
 
 pub struct SandboxExecutor {
@@ -286,11 +275,11 @@ pub fn run_memory_growth_with_limit(memory_limit_bytes: usize) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
+    use crate::execution::{AddArguments, ExecutionRequest};
 
     use super::{
-        AddArguments, ExecutionRequest, SandboxConfig, SandboxExecutor, run_addition,
-        run_infinite_loop_with_epoch_timeout, run_infinite_loop_with_fuel,
-        run_memory_growth_with_limit,
+        SandboxConfig, SandboxExecutor, run_addition, run_infinite_loop_with_epoch_timeout,
+        run_infinite_loop_with_fuel, run_memory_growth_with_limit,
     };
 
     use std::time::Duration;
