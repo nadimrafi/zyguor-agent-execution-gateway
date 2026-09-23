@@ -6,7 +6,9 @@ mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use execution::{AddArguments, ExecutionRequest, ReadFileArguments};
 use filesystem::FileSystemCapability;
-use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
+use policy::{
+    PolicyDecision, PolicyEvaluation, PolicyOperation, block_out_of_scope, evaluate_operation,
+};
 use sandbox::{SandboxConfig, SandboxExecutor};
 
 #[cfg(test)]
@@ -185,10 +187,21 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
         other => Err(format!("unsupported operation: {other}")),
     }
 }
-fn policy_operation_for(request: &ExecutionRequest) -> PolicyOperation {
+
+fn evaluate_request(
+    request: &ExecutionRequest,
+    filesystem: &FileSystemCapability,
+) -> PolicyEvaluation {
     match request {
-        ExecutionRequest::Add(_) => PolicyOperation::Add,
-        ExecutionRequest::ReadFile(_) => PolicyOperation::ReadFile,
+        ExecutionRequest::Add(_) => evaluate_operation(PolicyOperation::Add),
+
+        ExecutionRequest::ReadFile(arguments) => {
+            if filesystem.resolve_existing_path(&arguments.path).is_err() {
+                block_out_of_scope()
+            } else {
+                evaluate_operation(PolicyOperation::ReadFile)
+            }
+        }
     }
 }
 
@@ -197,8 +210,7 @@ fn execute_request(
     filesystem: &FileSystemCapability,
 ) -> Result<String, String> {
     let request = build_execution_request(params)?;
-    let policy_operation = policy_operation_for(&request);
-    let evaluation = evaluate_operation(policy_operation);
+    let evaluation = evaluate_request(&request, filesystem);
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
     execute_message_with_audit(
@@ -250,9 +262,9 @@ mod gateway_tests {
     use super::ExecutionResult;
     use super::{
         AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
-        ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyEvaluation,
-        PolicyOperation, build_execution_request, execute_message_with_audit, execute_request,
-        policy_operation_for, run_infinite_loop_with_fuel,
+        ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyDecision,
+        PolicyEvaluation, ReadFileArguments, build_execution_request, evaluate_request,
+        execute_message_with_audit, execute_request, run_infinite_loop_with_fuel,
     };
     use crate::policy::evaluate_message;
 
@@ -378,10 +390,27 @@ mod gateway_tests {
     }
 
     #[test]
-    fn maps_add_to_add_policy_operation() {
+    fn authorizes_add_request() {
         let request = ExecutionRequest::Add(AddArguments { left: 2, right: 3 });
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
 
-        assert_eq!(policy_operation_for(&request), PolicyOperation::Add);
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, crate::policy::PolicyReason::Safe);
+    }
+    #[test]
+    fn blocks_out_of_scope_read_file_request() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::ReadFile(ReadFileArguments {
+            path: "../outside.txt".to_owned(),
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, crate::policy::PolicyReason::OutOfScope);
     }
 
     #[test]
@@ -810,11 +839,11 @@ mod gateway_tests {
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
 
-        assert_eq!(json["decision"], "Allow");
-        assert_eq!(json["reason"], "Safe");
-        assert_eq!(json["status"], "execution_failed");
+        assert_eq!(json["decision"], "Block");
+        assert_eq!(json["reason"], "OutOfScope");
+        assert_eq!(json["status"], "blocked");
         assert_eq!(json["executed"], false);
-        assert_eq!(json["execution_outcome"], "Failed");
+        assert_eq!(json["execution_outcome"], "NotExecuted");
         assert!(json["result"].is_null());
 
         std::fs::remove_dir_all(&workspace_root)

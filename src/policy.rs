@@ -12,6 +12,7 @@ pub enum PolicyReason {
     Safe,
     Write,
     Destructive,
+    OutOfScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -32,6 +33,13 @@ pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
             decision: PolicyDecision::Allow,
             reason: PolicyReason::Safe,
         },
+    }
+}
+
+pub fn block_out_of_scope() -> PolicyEvaluation {
+    PolicyEvaluation {
+        decision: PolicyDecision::Block,
+        reason: PolicyReason::OutOfScope,
     }
 }
 
@@ -66,8 +74,17 @@ pub fn evaluate_message(message: &str) -> PolicyEvaluation {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyDecision, PolicyOperation, PolicyReason, evaluate_message, evaluate_operation,
+        PolicyDecision, PolicyOperation, PolicyReason, block_out_of_scope, evaluate_message,
+        evaluate_operation,
     };
+
+    #[test]
+    fn blocks_out_of_scope_resource() {
+        let evaluation = block_out_of_scope();
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::OutOfScope);
+    }
 
     #[test]
     fn allows_add_operation() {
