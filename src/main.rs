@@ -1,9 +1,11 @@
 mod audit;
 mod execution;
+mod filesystem;
 mod policy;
 mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use execution::{AddArguments, ExecutionRequest, ReadFileArguments};
+use filesystem::FileSystemCapability;
 use policy::{PolicyDecision, PolicyEvaluation, PolicyOperation, evaluate_operation};
 use sandbox::{SandboxConfig, SandboxExecutor};
 
@@ -32,9 +34,11 @@ struct ExecutionContextParams {
     purpose: String,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-struct ExecutionResult {
-    value: i32,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ExecutionResult {
+    Integer { value: i32 },
+    Text { content: String },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -49,7 +53,9 @@ struct GatewayResponse<'a> {
 }
 
 #[derive(Clone)]
-struct ZyguorGateway;
+struct ZyguorGateway {
+    filesystem: FileSystemCapability,
+}
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
 
@@ -75,7 +81,7 @@ fn execute_message_with_audit<F, S>(
 ) -> Result<String, String>
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
-    S: FnOnce() -> Result<i32, String>,
+    S: FnOnce() -> Result<ExecutionResult, String>,
 {
     validate_message(message)?;
 
@@ -97,12 +103,7 @@ where
                 .map_err(|error| format!("failed to persist pre-execution audit: {error}"))?;
 
             match sandbox_runner() {
-                Ok(value) => (
-                    "executed",
-                    true,
-                    Some(ExecutionResult { value }),
-                    ExecutionOutcome::Success,
-                ),
+                Ok(result) => ("executed", true, Some(result), ExecutionOutcome::Success),
                 Err(_) => ("execution_failed", false, None, ExecutionOutcome::Failed),
             }
         }
@@ -191,7 +192,10 @@ fn policy_operation_for(request: &ExecutionRequest) -> PolicyOperation {
     }
 }
 
-fn execute_request(params: &ExecuteParams) -> Result<String, String> {
+fn execute_request(
+    params: &ExecuteParams,
+    filesystem: &FileSystemCapability,
+) -> Result<String, String> {
     let request = build_execution_request(params)?;
     let policy_operation = policy_operation_for(&request);
     let evaluation = evaluate_operation(policy_operation);
@@ -202,21 +206,23 @@ fn execute_request(params: &ExecuteParams) -> Result<String, String> {
         evaluation,
         persist_audit,
         || match request {
-            ExecutionRequest::Add(arguments) => executor.execute_add(arguments),
-            ExecutionRequest::ReadFile(arguments) => Err(format!(
-                "read_file execution is not implemented yet for path: {}",
-                arguments.path
-            )),
+            ExecutionRequest::Add(arguments) => executor
+                .execute_add(arguments)
+                .map(|value| ExecutionResult::Integer { value }),
+
+            ExecutionRequest::ReadFile(arguments) => filesystem
+                .read_text_file(&arguments.path)
+                .map(|content| ExecutionResult::Text { content }),
         },
     )
 }
 #[tool_router(server_handler)]
 impl ZyguorGateway {
     #[tool(
-        description = "Evaluates and executes a structured request through the Zyguor policy-controlled Wasmtime sandbox."
+        description = "Evaluates and executes structured requests through Zyguor policy-controlled execution capabilities."
     )]
     fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
-        match execute_request(&params) {
+        match execute_request(&params, &self.filesystem) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
         }
@@ -225,7 +231,14 @@ impl ZyguorGateway {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let service = ZyguorGateway.serve(stdio()).await?;
+    let workspace_root = std::env::var("ZYGUOR_WORKSPACE_ROOT")
+        .map_err(|_| "ZYGUOR_WORKSPACE_ROOT must be configured")?;
+
+    let gateway = ZyguorGateway {
+        filesystem: FileSystemCapability::new(workspace_root.into()),
+    };
+
+    let service = gateway.serve(stdio()).await?;
 
     service.waiting().await?;
 
@@ -234,11 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod gateway_tests {
+    use super::ExecutionResult;
     use super::{
         AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
-        ExecutionRequest, MAX_MESSAGE_LENGTH, PolicyEvaluation, PolicyOperation,
-        build_execution_request, execute_message_with_audit, execute_request, policy_operation_for,
-        run_infinite_loop_with_fuel,
+        ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyEvaluation,
+        PolicyOperation, build_execution_request, execute_message_with_audit, execute_request,
+        policy_operation_for, run_infinite_loop_with_fuel,
     };
     use crate::policy::evaluate_message;
 
@@ -250,23 +264,22 @@ mod gateway_tests {
         evaluate_message(message)
     }
 
-    fn sandbox_success() -> Result<i32, String> {
-        Ok(5)
+    fn sandbox_success() -> Result<ExecutionResult, String> {
+        Ok(ExecutionResult::Integer { value: 5 })
     }
 
-    fn sandbox_real_fuel_failure() -> Result<i32, String> {
+    fn sandbox_real_fuel_failure() -> Result<ExecutionResult, String> {
         run_infinite_loop_with_fuel(1_000)?;
-        Ok(0)
+        Ok(ExecutionResult::Integer { value: 0 })
     }
 
-    fn sandbox_failure() -> Result<i32, String> {
+    fn sandbox_failure() -> Result<ExecutionResult, String> {
         Err("simulated sandbox failure".to_owned())
     }
 
-    fn sandbox_must_not_run() -> Result<i32, String> {
+    fn sandbox_must_not_run() -> Result<ExecutionResult, String> {
         Err("sandbox was called unexpectedly".to_owned())
     }
-
     #[test]
     fn builds_add_execution_request() -> Result<(), String> {
         let params = ExecuteParams {
@@ -425,21 +438,26 @@ mod gateway_tests {
 
     #[test]
     fn allow_executes_message() -> Result<(), String> {
-        let message = "read the project status";
+        let message = "read project status";
 
-        let result =
-            execute_message_with_audit(message, evaluation_for(message), no_op_audit, || Ok(5))?;
+        let result = execute_message_with_audit(
+            message,
+            evaluation_for(message),
+            no_op_audit,
+            sandbox_success,
+        )?;
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result).map_err(|error| error.to_string())?;
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
 
-        assert_eq!(parsed["status"], "executed");
-        assert_eq!(parsed["decision"], "Allow");
-        assert_eq!(parsed["reason"], "Safe");
-        assert_eq!(parsed["executed"], true);
-        assert_eq!(parsed["execution_outcome"], "Success");
-        assert_eq!(parsed["result"]["value"], 5);
-        assert!(parsed.get("message").is_none());
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["execution_outcome"], "Success");
+        assert_eq!(json["result"]["type"], "integer");
+        assert_eq!(json["result"]["value"], 5);
+        assert!(json.get("message").is_none());
 
         Ok(())
     }
@@ -701,7 +719,9 @@ mod gateway_tests {
             },
         };
 
-        let result = execute_request(&params)?;
+        let workspace_root = std::env::temp_dir();
+        let filesystem = FileSystemCapability::new(workspace_root);
+        let result = execute_request(&params, &filesystem)?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -712,6 +732,93 @@ mod gateway_tests {
         assert_eq!(json["executed"], true);
         assert_eq!(json["result"]["value"], 5);
         assert_eq!(json["execution_outcome"], "Success");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_file_executes_inside_workspace() -> Result<(), String> {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "zyguor-read-file-integration-{}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let file_path = workspace_root.join("hello.txt");
+
+        std::fs::write(&file_path, "Hello from Zyguor")
+            .map_err(|error| format!("failed to write test file: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace_root.clone());
+
+        let params = ExecuteParams {
+            operation: "read_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("hello.txt".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "read an approved workspace file".to_owned(),
+            },
+        };
+
+        let result = execute_request(&params, &filesystem)?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["execution_outcome"], "Success");
+        assert_eq!(json["result"]["type"], "text");
+        assert_eq!(json["result"]["content"], "Hello from Zyguor");
+
+        std::fs::remove_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn read_file_rejects_path_outside_workspace() -> Result<(), String> {
+        let workspace_root =
+            std::env::temp_dir().join(format!("zyguor-read-file-escape-{}", std::process::id()));
+
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace_root.clone());
+
+        let params = ExecuteParams {
+            operation: "read_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("../outside.txt".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "attempt to read outside the approved workspace".to_owned(),
+            },
+        };
+
+        let result = execute_request(&params, &filesystem)?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["status"], "execution_failed");
+        assert_eq!(json["executed"], false);
+        assert_eq!(json["execution_outcome"], "Failed");
+        assert!(json["result"].is_null());
+
+        std::fs::remove_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
 
         Ok(())
     }
