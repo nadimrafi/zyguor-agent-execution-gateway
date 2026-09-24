@@ -63,13 +63,16 @@ impl FileSystemCapability {
             .canonicalize()
             .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
 
-        if candidate.exists() {
+        if candidate.symlink_metadata().is_ok() {
             let canonical_candidate = candidate
                 .canonicalize()
                 .map_err(|error| format!("failed to resolve requested path: {error}"))?;
 
             if !canonical_candidate.starts_with(&canonical_root) {
                 return Err("requested path escapes the workspace".to_owned());
+            }
+            if !canonical_candidate.is_file() {
+                return Err("write target must be a regular file".to_owned());
             }
 
             return Ok(canonical_candidate);
@@ -477,6 +480,68 @@ mod tests {
         let error = result.expect_err("invalid UTF-8 file should be rejected");
 
         assert!(error.starts_with("requested file is not valid UTF-8:"));
+
+        Ok(())
+    }
+    #[test]
+    fn rejects_directory_as_write_target() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-directory-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let directory_target = workspace.join("existing-directory");
+
+        fs::create_dir_all(&directory_target)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let result = capability.resolve_write_target("existing-directory");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(
+            result.expect_err("directory write target should be rejected"),
+            "write target must be a regular file"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_broken_final_symlink_as_write_target() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-broken-write-symlink-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        symlink("missing-target.txt", workspace.join("broken-link.txt"))
+            .map_err(|error| format!("failed to create broken symlink: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let result = capability.resolve_write_target("broken-link.txt");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        let error = result.expect_err("broken final symlink should be rejected");
+
+        assert!(error.starts_with("failed to resolve requested path:"));
 
         Ok(())
     }
