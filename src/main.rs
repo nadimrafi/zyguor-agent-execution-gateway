@@ -4,7 +4,7 @@ mod filesystem;
 mod policy;
 mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
-use execution::{AddArguments, ExecutionRequest, ReadFileArguments};
+use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArguments};
 use filesystem::FileSystemCapability;
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, block_out_of_scope, evaluate_operation,
@@ -23,6 +23,7 @@ struct ExecutionArgumentsParams {
     left: Option<i32>,
     right: Option<i32>,
     path: Option<String>,
+    content: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -184,6 +185,28 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
                 path: path.clone(),
             }))
         }
+        "write_file" => {
+            let path = params
+                .arguments
+                .path
+                .as_ref()
+                .ok_or_else(|| "write_file requires arguments.path".to_owned())?;
+
+            if path.trim().is_empty() {
+                return Err("write_file path cannot be empty".to_owned());
+            }
+
+            let content = params
+                .arguments
+                .content
+                .as_ref()
+                .ok_or_else(|| "write_file requires arguments.content".to_owned())?;
+
+            Ok(ExecutionRequest::WriteFile(WriteFileArguments {
+                path: path.clone(),
+                content: content.clone(),
+            }))
+        }
         other => Err(format!("unsupported operation: {other}")),
     }
 }
@@ -200,6 +223,14 @@ fn evaluate_request(
                 block_out_of_scope()
             } else {
                 evaluate_operation(PolicyOperation::ReadFile)
+            }
+        }
+
+        ExecutionRequest::WriteFile(arguments) => {
+            if filesystem.resolve_write_target(&arguments.path).is_err() {
+                block_out_of_scope()
+            } else {
+                evaluate_operation(PolicyOperation::WriteFile)
             }
         }
     }
@@ -225,6 +256,10 @@ fn execute_request(
             ExecutionRequest::ReadFile(arguments) => filesystem
                 .read_text_file(&arguments.path)
                 .map(|content| ExecutionResult::Text { content }),
+
+            ExecutionRequest::WriteFile(_) => {
+                Err("write_file execution requires approval and is not enabled".to_owned())
+            }
         },
     )
 }
@@ -263,8 +298,8 @@ mod gateway_tests {
     use super::{
         AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
         ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyDecision,
-        PolicyEvaluation, ReadFileArguments, build_execution_request, evaluate_request,
-        execute_message_with_audit, execute_request, run_infinite_loop_with_fuel,
+        PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
+        evaluate_request, execute_message_with_audit, execute_request, run_infinite_loop_with_fuel,
     };
     use crate::policy::evaluate_message;
 
@@ -300,6 +335,7 @@ mod gateway_tests {
                 left: Some(8),
                 right: Some(4),
                 path: None,
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "test addition".to_owned(),
@@ -312,7 +348,7 @@ mod gateway_tests {
             ExecutionRequest::Add(_) => {
                 // keep existing assertions
             }
-            ExecutionRequest::ReadFile(_) => {
+            ExecutionRequest::ReadFile(_) | ExecutionRequest::WriteFile(_) => {
                 panic!("expected Add execution request");
             }
         }
@@ -327,6 +363,7 @@ mod gateway_tests {
                 left: None,
                 right: None,
                 path: Some("README.md".to_owned()),
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -339,7 +376,7 @@ mod gateway_tests {
             ExecutionRequest::ReadFile(arguments) => {
                 assert_eq!(arguments.path, "README.md");
             }
-            ExecutionRequest::Add(_) => {
+            ExecutionRequest::Add(_) | ExecutionRequest::WriteFile(_) => {
                 panic!("expected ReadFile execution request");
             }
         }
@@ -353,6 +390,7 @@ mod gateway_tests {
                 left: None,
                 right: None,
                 path: None,
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -375,6 +413,7 @@ mod gateway_tests {
                 left: None,
                 right: None,
                 path: Some("   ".to_owned()),
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -387,6 +426,131 @@ mod gateway_tests {
             result.expect_err("blank path should be rejected"),
             "read_file path cannot be empty"
         );
+    }
+
+    #[test]
+    fn builds_write_file_execution_request() {
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("notes.txt".to_owned()),
+                content: Some("Hello from Zyguor".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "prepare workspace update".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params).expect("write_file request should be valid");
+
+        match request {
+            ExecutionRequest::WriteFile(arguments) => {
+                assert_eq!(arguments.path, "notes.txt");
+                assert_eq!(arguments.content, "Hello from Zyguor");
+            }
+            ExecutionRequest::Add(_) | ExecutionRequest::ReadFile(_) => {
+                panic!("expected WriteFile execution request");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_write_file_without_path() {
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: Some("Hello from Zyguor".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "prepare workspace update".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result.expect_err("missing path should be rejected"),
+            "write_file requires arguments.path"
+        );
+    }
+
+    #[test]
+    fn rejects_write_file_with_blank_path() {
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("   ".to_owned()),
+                content: Some("Hello from Zyguor".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "prepare workspace update".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result.expect_err("blank path should be rejected"),
+            "write_file path cannot be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_write_file_without_content() {
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("notes.txt".to_owned()),
+                content: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "prepare workspace update".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result.expect_err("missing content should be rejected"),
+            "write_file requires arguments.content"
+        );
+    }
+
+    #[test]
+    fn allows_write_file_with_empty_content() {
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("empty.txt".to_owned()),
+                content: Some(String::new()),
+            },
+            context: ExecutionContextParams {
+                purpose: "prepare empty workspace file".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params).expect("empty content should be valid");
+
+        match request {
+            ExecutionRequest::WriteFile(arguments) => {
+                assert_eq!(arguments.path, "empty.txt");
+                assert!(arguments.content.is_empty());
+            }
+            ExecutionRequest::Add(_) | ExecutionRequest::ReadFile(_) => {
+                panic!("expected WriteFile execution request");
+            }
+        }
     }
 
     #[test]
@@ -412,6 +576,50 @@ mod gateway_tests {
         assert_eq!(evaluation.decision, PolicyDecision::Block);
         assert_eq!(evaluation.reason, crate::policy::PolicyReason::OutOfScope);
     }
+    #[test]
+    fn reviews_write_file_inside_workspace() -> Result<(), String> {
+        use std::fs;
+
+        let test_root =
+            std::env::temp_dir().join(format!("zyguor-write-policy-test-{}", std::process::id()));
+
+        let workspace = test_root.join("workspace");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace);
+
+        let request = ExecutionRequest::WriteFile(WriteFileArguments {
+            path: "new.txt".to_owned(),
+            content: "approved content".to_owned(),
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(evaluation.decision, PolicyDecision::Review);
+        assert_eq!(evaluation.reason, crate::policy::PolicyReason::Write);
+
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_out_of_scope_write_file_request() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::WriteFile(WriteFileArguments {
+            path: "../outside.txt".to_owned(),
+            content: "must not be written".to_owned(),
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, crate::policy::PolicyReason::OutOfScope);
+    }
 
     #[test]
     fn normalizes_add_operation() -> Result<(), String> {
@@ -421,6 +629,7 @@ mod gateway_tests {
                 left: Some(3),
                 right: Some(6),
                 path: None,
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "test normalized operation".to_owned(),
@@ -434,7 +643,7 @@ mod gateway_tests {
                 assert_eq!(arguments.left, 3);
                 assert_eq!(arguments.right, 6);
             }
-            ExecutionRequest::ReadFile(_) => {
+            ExecutionRequest::ReadFile(_) | ExecutionRequest::WriteFile(_) => {
                 panic!("expected Add execution request");
             }
         }
@@ -450,6 +659,7 @@ mod gateway_tests {
                 left: Some(1),
                 right: Some(2),
                 path: None,
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "unsupported operation test".to_owned(),
@@ -742,6 +952,7 @@ mod gateway_tests {
                 left: Some(2),
                 right: Some(3),
                 path: None,
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "delete the production database".to_owned(),
@@ -788,6 +999,7 @@ mod gateway_tests {
                 left: None,
                 right: None,
                 path: Some("hello.txt".to_owned()),
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "read an approved workspace file".to_owned(),
@@ -828,6 +1040,7 @@ mod gateway_tests {
                 left: None,
                 right: None,
                 path: Some("../outside.txt".to_owned()),
+                content: None,
             },
             context: ExecutionContextParams {
                 purpose: "attempt to read outside the approved workspace".to_owned(),

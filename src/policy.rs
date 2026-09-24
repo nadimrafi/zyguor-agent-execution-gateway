@@ -25,6 +25,7 @@ pub struct PolicyEvaluation {
 pub enum PolicyOperation {
     Add,
     ReadFile,
+    WriteFile,
 }
 
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
@@ -32,6 +33,10 @@ pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
         PolicyOperation::Add | PolicyOperation::ReadFile => PolicyEvaluation {
             decision: PolicyDecision::Allow,
             reason: PolicyReason::Safe,
+        },
+        PolicyOperation::WriteFile => PolicyEvaluation {
+            decision: PolicyDecision::Review,
+            reason: PolicyReason::Write,
         },
     }
 }
@@ -92,6 +97,13 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+    #[test]
+    fn reviews_write_file_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::WriteFile);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Review);
+        assert_eq!(evaluation.reason, PolicyReason::Write);
     }
 
     #[test]

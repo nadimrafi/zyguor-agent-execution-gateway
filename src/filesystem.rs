@@ -54,6 +54,46 @@ impl FileSystemCapability {
 
         Ok(canonical_candidate)
     }
+
+    pub fn resolve_write_target(&self, requested_path: &str) -> Result<PathBuf, String> {
+        let candidate = self.validate_relative_path(requested_path)?;
+
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
+
+        if candidate.exists() {
+            let canonical_candidate = candidate
+                .canonicalize()
+                .map_err(|error| format!("failed to resolve requested path: {error}"))?;
+
+            if !canonical_candidate.starts_with(&canonical_root) {
+                return Err("requested path escapes the workspace".to_owned());
+            }
+
+            return Ok(canonical_candidate);
+        }
+
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| "write target must have a parent directory".to_owned())?;
+
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve write target parent: {error}"))?;
+
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err("requested path escapes the workspace".to_owned());
+        }
+
+        let file_name = candidate
+            .file_name()
+            .ok_or_else(|| "write target must include a file name".to_owned())?;
+
+        Ok(canonical_parent.join(file_name))
+    }
+
     pub fn read_text_file(&self, requested_path: &str) -> Result<String, String> {
         let resolved_path = self.resolve_existing_path(requested_path)?;
 
@@ -202,6 +242,152 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn resolves_new_write_target_inside_workspace() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-new-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let docs = workspace.join("docs");
+
+        fs::create_dir_all(&docs)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let resolved = capability.resolve_write_target("docs/new.txt")?;
+
+        let canonical_docs = docs
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve expected directory: {error}"))?;
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(resolved, canonical_docs.join("new.txt"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_existing_write_target_inside_workspace() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-existing-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let file = workspace.join("existing.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&file, "existing content")
+            .map_err(|error| format!("failed to create test file: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let resolved = capability.resolve_write_target("existing.txt")?;
+
+        let expected = file
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve expected file: {error}"))?;
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(resolved, expected);
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_write_symlink_that_escapes_workspace() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-symlink-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside = test_root.join("outside");
+        let outside_file = outside.join("secret.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&outside)
+            .map_err(|error| format!("failed to create outside directory: {error}"))?;
+
+        fs::write(&outside_file, "outside workspace")
+            .map_err(|error| format!("failed to create outside file: {error}"))?;
+
+        symlink(&outside_file, workspace.join("escape.txt"))
+            .map_err(|error| format!("failed to create test symlink: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let result = capability.resolve_write_target("escape.txt");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(
+            result.expect_err("symlink escape should be rejected"),
+            "requested path escapes the workspace"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_write_through_symlinked_parent_outside_workspace() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-parent-symlink-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside = test_root.join("outside");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&outside)
+            .map_err(|error| format!("failed to create outside directory: {error}"))?;
+
+        symlink(&outside, workspace.join("escape"))
+            .map_err(|error| format!("failed to create directory symlink: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let result = capability.resolve_write_target("escape/new.txt");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(
+            result.expect_err("symlinked parent escape should be rejected"),
+            "requested path escapes the workspace"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn reads_text_file_inside_workspace() -> Result<(), String> {
         use std::fs;
