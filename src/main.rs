@@ -20,9 +20,20 @@ use rmcp::{
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExecutionArgumentsParams {
+    #[serde(default)]
+    #[schemars(with = "i32")]
     left: Option<i32>,
+
+    #[serde(default)]
+    #[schemars(with = "i32")]
     right: Option<i32>,
+
+    #[serde(default)]
+    #[schemars(with = "String")]
     path: Option<String>,
+
+    #[serde(default)]
+    #[schemars(with = "String")]
     content: Option<String>,
 }
 
