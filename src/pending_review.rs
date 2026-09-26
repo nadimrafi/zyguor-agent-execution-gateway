@@ -39,6 +39,10 @@ impl PendingReviewStore {
         Ok(())
     }
 
+    pub fn take(&mut self, request_id: &Uuid) -> Option<PendingReview> {
+        self.reviews.remove(request_id)
+    }
+
     #[cfg(test)]
     pub fn get(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.reviews.get(request_id)
@@ -144,5 +148,32 @@ mod tests {
         assert_eq!(pending.request_id, request_id);
         assert_eq!(pending.request, request);
         assert_eq!(pending.purpose, "Update application configuration");
+    }
+    #[test]
+    fn taking_pending_review_removes_it_from_store() {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+
+        assert!(store.insert(pending.clone()).is_ok());
+
+        let taken = store.take(&request_id);
+
+        assert_eq!(taken, Some(pending));
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        let second_take = store.take(&request_id);
+
+        assert_eq!(second_take, None);
     }
 }

@@ -13,7 +13,11 @@ use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, block_out_of_scope, evaluate_operation,
 };
 use sandbox::{SandboxConfig, SandboxExecutor};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::net::UnixListener;
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -75,9 +79,39 @@ struct ZyguorGateway {
     filesystem: FileSystemCapability,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminCommand {
+    Reject { request_id: uuid::Uuid },
+}
+fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
+    let trimmed = input.trim();
+
+    let mut parts = trimmed.split_whitespace();
+
+    let command = parts
+        .next()
+        .ok_or_else(|| "admin command cannot be empty".to_owned())?;
+
+    let request_id = parts
+        .next()
+        .ok_or_else(|| "admin command requires a request ID".to_owned())?;
+
+    if parts.next().is_some() {
+        return Err("admin command contains unexpected arguments".to_owned());
+    }
+
+    if command != "REJECT" {
+        return Err("unsupported admin command".to_owned());
+    }
+
+    let request_id = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| "admin command contains an invalid request ID".to_owned())?;
+
+    Ok(AdminCommand::Reject { request_id })
+}
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
-
+const MAX_ADMIN_COMMAND_LENGTH: usize = 256;
 fn validate_message(message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("message cannot be empty".to_owned());
@@ -251,6 +285,28 @@ fn evaluate_request(
     }
 }
 
+fn reject_pending_request(
+    request_id: uuid::Uuid,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<PendingReview, String> {
+    let mut store = pending_reviews
+        .lock()
+        .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+    store
+        .take(&request_id)
+        .ok_or_else(|| "pending review request not found".to_owned())
+}
+
+fn handle_admin_command(
+    command: AdminCommand,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<PendingReview, String> {
+    match command {
+        AdminCommand::Reject { request_id } => reject_pending_request(request_id, pending_reviews),
+    }
+}
+
 fn execute_request(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
@@ -306,19 +362,88 @@ impl ZyguorGateway {
     }
 }
 
+async fn create_admin_listener(socket_path: &Path) -> Result<UnixListener, String> {
+    if socket_path.exists() {
+        return Err("admin socket path already exists".to_owned());
+    }
+
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|error| format!("failed to create admin socket: {error}"))?;
+
+    let permissions = std::fs::Permissions::from_mode(0o600);
+
+    std::fs::set_permissions(socket_path, permissions)
+        .map_err(|error| format!("failed to secure admin socket permissions: {error}"))?;
+
+    Ok(listener)
+}
+async fn handle_admin_connection(
+    stream: tokio::net::UnixStream,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<PendingReview, String> {
+    let reader = BufReader::new(stream);
+    let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
+    let mut input = String::new();
+
+    let bytes_read = reader
+        .read_line(&mut input)
+        .await
+        .map_err(|error| format!("failed to read admin command: {error}"))?;
+
+    if bytes_read == 0 {
+        return Err("admin connection closed without a command".to_owned());
+    }
+
+    if input.len() > MAX_ADMIN_COMMAND_LENGTH {
+        return Err("admin command exceeds maximum length".to_owned());
+    }
+
+    let command = parse_admin_command(&input)?;
+
+    handle_admin_command(command, pending_reviews)
+}
+async fn run_admin_listener(
+    listener: UnixListener,
+    pending_reviews: Arc<Mutex<PendingReviewStore>>,
+) -> Result<(), String> {
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        if let Err(error) = handle_admin_connection(stream, &pending_reviews).await {
+            eprintln!("admin command rejected: {error}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::var("ZYGUOR_WORKSPACE_ROOT")
         .map_err(|_| "ZYGUOR_WORKSPACE_ROOT must be configured")?;
+    let admin_socket_path = std::env::var("ZYGUOR_ADMIN_SOCKET")
+        .map_err(|_| "ZYGUOR_ADMIN_SOCKET must be configured")?;
+
+    let admin_listener = create_admin_listener(Path::new(&admin_socket_path)).await?;
+
+    let pending_reviews = Arc::new(Mutex::new(PendingReviewStore::new()));
 
     let gateway = ZyguorGateway {
         filesystem: FileSystemCapability::new(workspace_root.into()),
-        pending_reviews: Arc::new(Mutex::new(PendingReviewStore::new())),
+        pending_reviews: Arc::clone(&pending_reviews),
     };
+
+    let admin_task = tokio::spawn(run_admin_listener(
+        admin_listener,
+        Arc::clone(&pending_reviews),
+    ));
 
     let service = gateway.serve(stdio()).await?;
 
     service.waiting().await?;
+
+    admin_task.abort();
 
     Ok(())
 }
@@ -327,10 +452,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod gateway_tests {
     use super::ExecutionResult;
     use super::{
-        AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
-        ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyDecision,
-        PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
-        evaluate_request, execute_message_with_audit_id, execute_request,
+        AddArguments, AdminCommand, ExecuteParams, ExecutionArgumentsParams,
+        ExecutionContextParams, ExecutionRequest, FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH,
+        MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation, ReadFileArguments,
+        WriteFileArguments, build_execution_request, create_admin_listener, evaluate_request,
+        execute_message_with_audit_id, execute_request, handle_admin_command,
+        handle_admin_connection, parse_admin_command, reject_pending_request,
         run_infinite_loop_with_fuel,
     };
     use crate::pending_review::PendingReviewStore;
@@ -382,6 +509,243 @@ mod gateway_tests {
     fn sandbox_must_not_run() -> Result<ExecutionResult, String> {
         Err("sandbox was called unexpectedly".to_owned())
     }
+    #[tokio::test]
+    async fn admin_connection_rejects_pending_request() -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+        let pending_reviews = empty_pending_review_store();
+        let request_id = uuid::Uuid::new_v4();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "config/settings.txt".to_owned(),
+                    content: "enabled=true".to_owned(),
+                }),
+                "Update application configuration".to_owned(),
+            ))?;
+        }
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))?;
+
+            let command = format!("REJECT {request_id}\n");
+
+            stream
+                .write_all(command.as_bytes())
+                .await
+                .map_err(|error| format!("failed to write admin command: {error}"))
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let rejected = handle_admin_connection(stream, &pending_reviews).await?;
+
+        client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert_eq!(rejected.request_id, request_id);
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert!(store.get(&request_id).is_none());
+        }
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_connection_rejects_oversized_command_without_consuming_request()
+    -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+        let pending_reviews = empty_pending_review_store();
+        let request_id = uuid::Uuid::new_v4();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "config/settings.txt".to_owned(),
+                    content: "enabled=true".to_owned(),
+                }),
+                "Update application configuration".to_owned(),
+            ))?;
+        }
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))?;
+
+            let oversized = format!(
+                "REJECT {request_id} {}",
+                "x".repeat(MAX_ADMIN_COMMAND_LENGTH)
+            );
+
+            stream
+                .write_all(oversized.as_bytes())
+                .await
+                .map_err(|error| format!("failed to write admin command: {error}"))
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let result = handle_admin_connection(stream, &pending_reviews).await;
+
+        client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert_eq!(
+            result,
+            Err("admin command exceeds maximum length".to_owned())
+        );
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert!(store.get(&request_id).is_some());
+        }
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn parses_reject_admin_command() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let input = format!("REJECT {request_id}");
+
+        let command = parse_admin_command(&input)?;
+
+        assert_eq!(command, AdminCommand::Reject { request_id });
+
+        Ok(())
+    }
+    #[test]
+    fn rejects_invalid_admin_commands() {
+        let request_id = uuid::Uuid::new_v4();
+
+        assert_eq!(
+            parse_admin_command(""),
+            Err("admin command cannot be empty".to_owned())
+        );
+
+        assert_eq!(
+            parse_admin_command("REJECT"),
+            Err("admin command requires a request ID".to_owned())
+        );
+
+        assert_eq!(
+            parse_admin_command("REJECT not-a-uuid"),
+            Err("admin command contains an invalid request ID".to_owned())
+        );
+
+        assert_eq!(
+            parse_admin_command(&format!("APPROVE {request_id}")),
+            Err("unsupported admin command".to_owned())
+        );
+
+        assert_eq!(
+            parse_admin_command(&format!("REJECT {request_id} extra")),
+            Err("admin command contains unexpected arguments".to_owned())
+        );
+    }
+    #[tokio::test]
+    async fn admin_socket_is_created_with_owner_only_permissions() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+
+        let metadata = std::fs::metadata(&socket_path)
+            .map_err(|error| format!("failed to inspect admin socket: {error}"))?;
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_socket_refuses_existing_path() -> Result<(), String> {
+        let socket_path = std::env::temp_dir().join(format!(
+            "zyguor-admin-existing-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::write(&socket_path, b"do not overwrite")
+            .map_err(|error| format!("failed to create test path: {error}"))?;
+
+        let result = create_admin_listener(&socket_path).await;
+
+        assert_eq!(
+            result.err(),
+            Some("admin socket path already exists".to_owned())
+        );
+
+        let contents = std::fs::read(&socket_path)
+            .map_err(|error| format!("failed to read existing test path: {error}"))?;
+
+        assert_eq!(contents, b"do not overwrite");
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test path: {error}"))?;
+
+        Ok(())
+    }
+
     #[test]
     fn builds_add_execution_request() -> Result<(), String> {
         let params = ExecuteParams {
@@ -410,6 +774,41 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn rejecting_pending_request_consumes_it_once() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "config/settings.txt".to_owned(),
+                    content: "enabled=true".to_owned(),
+                }),
+                "Update application configuration".to_owned(),
+            ))?;
+        }
+
+        let rejected = handle_admin_command(AdminCommand::Reject { request_id }, &pending_reviews)?;
+
+        assert_eq!(rejected.request_id, request_id);
+        assert_eq!(rejected.purpose, "Update application configuration");
+
+        let second_rejection = reject_pending_request(request_id, &pending_reviews);
+
+        assert_eq!(
+            second_rejection,
+            Err("pending review request not found".to_owned())
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn supplied_request_id_is_preserved_in_response_and_audit() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
