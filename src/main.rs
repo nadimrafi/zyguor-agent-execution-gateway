@@ -1,15 +1,19 @@
 mod audit;
 mod execution;
 mod filesystem;
+mod pending_review;
 mod policy;
 mod sandbox;
+
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArguments};
 use filesystem::FileSystemCapability;
+use pending_review::{PendingReview, PendingReviewStore};
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, block_out_of_scope, evaluate_operation,
 };
 use sandbox::{SandboxConfig, SandboxExecutor};
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -69,6 +73,7 @@ struct GatewayResponse<'a> {
 #[derive(Clone)]
 struct ZyguorGateway {
     filesystem: FileSystemCapability,
+    pending_reviews: Arc<Mutex<PendingReviewStore>>,
 }
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
@@ -85,25 +90,6 @@ fn validate_message(message: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn execute_message_with_audit<F, S>(
-    message: &str,
-    evaluation: PolicyEvaluation,
-    audit_writer: F,
-    sandbox_runner: S,
-) -> Result<String, String>
-where
-    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
-    S: FnOnce() -> Result<ExecutionResult, String>,
-{
-    execute_message_with_audit_id(
-        uuid::Uuid::new_v4(),
-        message,
-        evaluation,
-        audit_writer,
-        sandbox_runner,
-    )
 }
 
 fn execute_message_with_audit_id<F, S>(
@@ -268,12 +254,27 @@ fn evaluate_request(
 fn execute_request(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
 ) -> Result<String, String> {
     let request = build_execution_request(params)?;
     let evaluation = evaluate_request(&request, filesystem);
+    let request_id = uuid::Uuid::new_v4();
+
+    if evaluation.decision == PolicyDecision::Review {
+        let pending =
+            PendingReview::new(request_id, request.clone(), params.context.purpose.clone());
+
+        let mut store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        store.insert(pending)?;
+    }
+
     let executor = SandboxExecutor::new(SandboxConfig::default());
 
-    execute_message_with_audit(
+    execute_message_with_audit_id(
+        request_id,
         &params.context.purpose,
         evaluation,
         persist_audit,
@@ -298,7 +299,7 @@ impl ZyguorGateway {
         description = "Evaluates and executes structured requests through Zyguor policy-controlled execution capabilities."
     )]
     fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
-        match execute_request(&params, &self.filesystem) {
+        match execute_request(&params, &self.filesystem, &self.pending_reviews) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
         }
@@ -312,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gateway = ZyguorGateway {
         filesystem: FileSystemCapability::new(workspace_root.into()),
+        pending_reviews: Arc::new(Mutex::new(PendingReviewStore::new())),
     };
 
     let service = gateway.serve(stdio()).await?;
@@ -328,13 +330,18 @@ mod gateway_tests {
         AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
         ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyDecision,
         PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
-        evaluate_request, execute_message_with_audit, execute_message_with_audit_id,
-        execute_request, run_infinite_loop_with_fuel,
+        evaluate_request, execute_message_with_audit_id, execute_request,
+        run_infinite_loop_with_fuel,
     };
+    use crate::pending_review::PendingReviewStore;
     use crate::policy::evaluate_message;
+    use std::sync::{Arc, Mutex};
 
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
         Ok(())
+    }
+    fn empty_pending_review_store() -> Arc<Mutex<PendingReviewStore>> {
+        Arc::new(Mutex::new(PendingReviewStore::new()))
     }
 
     fn evaluation_for(message: &str) -> PolicyEvaluation {
@@ -352,6 +359,24 @@ mod gateway_tests {
 
     fn sandbox_failure() -> Result<ExecutionResult, String> {
         Err("simulated sandbox failure".to_owned())
+    }
+    fn execute_message_with_audit<F, S>(
+        message: &str,
+        evaluation: PolicyEvaluation,
+        audit_writer: F,
+        sandbox_runner: S,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&crate::audit::AuditRecord<'_>) -> Result<(), String>,
+        S: FnOnce() -> Result<ExecutionResult, String>,
+    {
+        execute_message_with_audit_id(
+            uuid::Uuid::new_v4(),
+            message,
+            evaluation,
+            audit_writer,
+            sandbox_runner,
+        )
     }
 
     fn sandbox_must_not_run() -> Result<ExecutionResult, String> {
@@ -660,6 +685,79 @@ mod gateway_tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Review);
         assert_eq!(evaluation.reason, crate::policy::PolicyReason::Write);
+
+        Ok(())
+    }
+    #[test]
+    fn reviewed_write_request_is_stored_as_pending() -> Result<(), String> {
+        use std::fs;
+
+        let test_root =
+            std::env::temp_dir().join(format!("zyguor-pending-write-test-{}", std::process::id()));
+
+        let workspace = test_root.join("workspace");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace);
+
+        let params = ExecuteParams {
+            operation: "write_file".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: Some("new.txt".to_owned()),
+                content: Some("pending content".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "Update application configuration".to_owned(),
+            },
+        };
+
+        let pending_reviews = empty_pending_review_store();
+
+        let result = execute_request(&params, &filesystem, &pending_reviews)?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["status"], "held_for_review");
+        assert_eq!(json["decision"], "Review");
+        assert_eq!(json["executed"], false);
+
+        let request_id = json["request_id"]
+            .as_str()
+            .ok_or_else(|| "response request_id must be a string".to_owned())?;
+
+        let request_id = uuid::Uuid::parse_str(request_id)
+            .map_err(|error| format!("response request_id is invalid: {error}"))?;
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert_eq!(store.len(), 1);
+
+        let pending = store
+            .get(&request_id)
+            .ok_or_else(|| "reviewed request was not stored".to_owned())?;
+
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.purpose, "Update application configuration");
+
+        assert_eq!(
+            pending.request,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "new.txt".to_owned(),
+                content: "pending content".to_owned(),
+            })
+        );
+
+        drop(store);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
 
         Ok(())
     }
@@ -1019,7 +1117,8 @@ mod gateway_tests {
 
         let workspace_root = std::env::temp_dir();
         let filesystem = FileSystemCapability::new(workspace_root);
-        let result = execute_request(&params, &filesystem)?;
+        let pending_reviews = empty_pending_review_store();
+        let result = execute_request(&params, &filesystem, &pending_reviews)?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -1063,8 +1162,8 @@ mod gateway_tests {
                 purpose: "read an approved workspace file".to_owned(),
             },
         };
-
-        let result = execute_request(&params, &filesystem)?;
+        let pending_reviews = empty_pending_review_store();
+        let result = execute_request(&params, &filesystem, &pending_reviews)?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -1105,7 +1204,8 @@ mod gateway_tests {
             },
         };
 
-        let result = execute_request(&params, &filesystem)?;
+        let pending_reviews = empty_pending_review_store();
+        let result = execute_request(&params, &filesystem, &pending_reviews)?;
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;

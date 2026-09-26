@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddArguments {
     pub left: i32,
     pub right: i32,
@@ -14,7 +14,7 @@ pub struct WriteFileArguments {
     pub content: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionRequest {
     Add(AddArguments),
     ReadFile(ReadFileArguments),
