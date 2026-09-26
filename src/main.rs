@@ -90,6 +90,26 @@ fn validate_message(message: &str) -> Result<(), String> {
 fn execute_message_with_audit<F, S>(
     message: &str,
     evaluation: PolicyEvaluation,
+    audit_writer: F,
+    sandbox_runner: S,
+) -> Result<String, String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+    S: FnOnce() -> Result<ExecutionResult, String>,
+{
+    execute_message_with_audit_id(
+        uuid::Uuid::new_v4(),
+        message,
+        evaluation,
+        audit_writer,
+        sandbox_runner,
+    )
+}
+
+fn execute_message_with_audit_id<F, S>(
+    request_id: uuid::Uuid,
+    message: &str,
+    evaluation: PolicyEvaluation,
     mut audit_writer: F,
     sandbox_runner: S,
 ) -> Result<String, String>
@@ -98,8 +118,6 @@ where
     S: FnOnce() -> Result<ExecutionResult, String>,
 {
     validate_message(message)?;
-
-    let request_id = uuid::Uuid::new_v4();
 
     let (status, executed, result, execution_outcome) = match evaluation.decision {
         PolicyDecision::Allow => {
@@ -310,7 +328,8 @@ mod gateway_tests {
         AddArguments, ExecuteParams, ExecutionArgumentsParams, ExecutionContextParams,
         ExecutionRequest, FileSystemCapability, MAX_MESSAGE_LENGTH, PolicyDecision,
         PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
-        evaluate_request, execute_message_with_audit, execute_request, run_infinite_loop_with_fuel,
+        evaluate_request, execute_message_with_audit, execute_message_with_audit_id,
+        execute_request, run_infinite_loop_with_fuel,
     };
     use crate::policy::evaluate_message;
 
@@ -366,6 +385,34 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn supplied_request_id_is_preserved_in_response_and_audit() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let message = "write a new configuration";
+        let mut audited_request_id = None;
+
+        let result = execute_message_with_audit_id(
+            request_id,
+            message,
+            evaluation_for(message),
+            |record| {
+                audited_request_id = Some(record.request_id);
+                Ok(())
+            },
+            sandbox_success,
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["request_id"], request_id.to_string());
+        assert_eq!(audited_request_id, Some(request_id));
+        assert_eq!(json["status"], "held_for_review");
+        assert_eq!(json["executed"], false);
+
+        Ok(())
+    }
+
     #[test]
     fn builds_read_file_execution_request() {
         let params = ExecuteParams {
