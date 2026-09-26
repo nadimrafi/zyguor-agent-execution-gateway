@@ -43,7 +43,6 @@ impl PendingReviewStore {
         self.reviews.remove(request_id)
     }
 
-    #[cfg(test)]
     pub fn get(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.reviews.get(request_id)
     }

@@ -81,6 +81,7 @@ struct ZyguorGateway {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminCommand {
+    Approve { request_id: uuid::Uuid },
     Reject { request_id: uuid::Uuid },
 }
 fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
@@ -100,14 +101,14 @@ fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
         return Err("admin command contains unexpected arguments".to_owned());
     }
 
-    if command != "REJECT" {
-        return Err("unsupported admin command".to_owned());
-    }
-
     let request_id = uuid::Uuid::parse_str(request_id)
         .map_err(|_| "admin command contains an invalid request ID".to_owned())?;
 
-    Ok(AdminCommand::Reject { request_id })
+    match command {
+        "APPROVE" => Ok(AdminCommand::Approve { request_id }),
+        "REJECT" => Ok(AdminCommand::Reject { request_id }),
+        _ => Err("unsupported admin command".to_owned()),
+    }
 }
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
@@ -297,12 +298,46 @@ fn reject_pending_request(
         .take(&request_id)
         .ok_or_else(|| "pending review request not found".to_owned())
 }
+fn inspect_pending_request(
+    request_id: uuid::Uuid,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<PendingReview, String> {
+    let store = pending_reviews
+        .lock()
+        .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+    store
+        .get(&request_id)
+        .cloned()
+        .ok_or_else(|| "pending review request not found".to_owned())
+}
+fn revalidate_pending_request(
+    pending: &PendingReview,
+    filesystem: &FileSystemCapability,
+) -> Result<(), String> {
+    match &pending.request {
+        ExecutionRequest::WriteFile(arguments) => filesystem
+            .resolve_write_target(&arguments.path)
+            .map(|_| ())
+            .map_err(|error| format!("pending write target is no longer valid: {error}")),
+
+        _ => Err("pending request is not eligible for approval".to_owned()),
+    }
+}
 
 fn handle_admin_command(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    filesystem: &FileSystemCapability,
 ) -> Result<PendingReview, String> {
     match command {
+        AdminCommand::Approve { request_id } => {
+            let pending = inspect_pending_request(request_id, pending_reviews)?;
+
+            revalidate_pending_request(&pending, filesystem)?;
+
+            Err("admin approval is not enabled".to_owned())
+        }
         AdminCommand::Reject { request_id } => reject_pending_request(request_id, pending_reviews),
     }
 }
@@ -380,6 +415,7 @@ async fn create_admin_listener(socket_path: &Path) -> Result<UnixListener, Strin
 async fn handle_admin_connection(
     stream: tokio::net::UnixStream,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    filesystem: &FileSystemCapability,
 ) -> Result<PendingReview, String> {
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
@@ -400,11 +436,12 @@ async fn handle_admin_connection(
 
     let command = parse_admin_command(&input)?;
 
-    handle_admin_command(command, pending_reviews)
+    handle_admin_command(command, pending_reviews, filesystem)
 }
 async fn run_admin_listener(
     listener: UnixListener,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
+    filesystem: FileSystemCapability,
 ) -> Result<(), String> {
     loop {
         let (stream, _) = listener
@@ -412,7 +449,7 @@ async fn run_admin_listener(
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
-        if let Err(error) = handle_admin_connection(stream, &pending_reviews).await {
+        if let Err(error) = handle_admin_connection(stream, &pending_reviews, &filesystem).await {
             eprintln!("admin command rejected: {error}");
         }
     }
@@ -429,14 +466,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pending_reviews = Arc::new(Mutex::new(PendingReviewStore::new()));
 
+    let filesystem = FileSystemCapability::new(workspace_root.into());
+
     let gateway = ZyguorGateway {
-        filesystem: FileSystemCapability::new(workspace_root.into()),
+        filesystem: filesystem.clone(),
         pending_reviews: Arc::clone(&pending_reviews),
     };
 
     let admin_task = tokio::spawn(run_admin_listener(
         admin_listener,
         Arc::clone(&pending_reviews),
+        filesystem,
     ));
 
     let service = gateway.serve(stdio()).await?;
@@ -556,7 +596,8 @@ mod gateway_tests {
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
-        let rejected = handle_admin_connection(stream, &pending_reviews).await?;
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let rejected = handle_admin_connection(stream, &pending_reviews, &filesystem).await?;
 
         client
             .await
@@ -576,6 +617,66 @@ mod gateway_tests {
 
         std::fs::remove_file(&socket_path)
             .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn approval_of_unknown_request_is_rejected() {
+        let pending_reviews = empty_pending_review_store();
+        let request_id = uuid::Uuid::new_v4();
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert_eq!(result, Err("pending review request not found".to_owned()));
+    }
+
+    #[test]
+    fn approval_revalidates_write_target_and_retains_invalid_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "../outside.txt".to_owned(),
+                    content: "should not be written".to_owned(),
+                }),
+                "Attempt invalid write".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert_eq!(
+        result,
+        Err(
+            "pending write target is no longer valid: parent directory traversal is not allowed"
+                .to_owned()
+        )
+    );
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+        assert_eq!(store.len(), 1);
 
         Ok(())
     }
@@ -631,7 +732,8 @@ mod gateway_tests {
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
-        let result = handle_admin_connection(stream, &pending_reviews).await;
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
 
         client
             .await
@@ -688,14 +790,71 @@ mod gateway_tests {
         );
 
         assert_eq!(
-            parse_admin_command(&format!("APPROVE {request_id}")),
-            Err("unsupported admin command".to_owned())
-        );
-
-        assert_eq!(
             parse_admin_command(&format!("REJECT {request_id} extra")),
             Err("admin command contains unexpected arguments".to_owned())
         );
+    }
+    #[test]
+    fn disabled_approval_does_not_consume_pending_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "config/settings.txt".to_owned(),
+                    content: "enabled=true".to_owned(),
+                }),
+                "Update application configuration".to_owned(),
+            ))?;
+        }
+
+        let workspace =
+            std::env::temp_dir().join(format!("zyguor-disabled-approval-test-{request_id}"));
+
+        let config_dir = workspace.join("config");
+
+        std::fs::create_dir_all(&config_dir)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace.clone());
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert_eq!(result, Err("admin approval is not enabled".to_owned()));
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+        assert_eq!(store.len(), 1);
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn parses_approve_admin_command() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let input = format!("APPROVE {request_id}");
+
+        let command = parse_admin_command(&input)?;
+
+        assert_eq!(command, AdminCommand::Approve { request_id });
+
+        Ok(())
     }
     #[tokio::test]
     async fn admin_socket_is_created_with_owner_only_permissions() -> Result<(), String> {
@@ -794,7 +953,12 @@ mod gateway_tests {
             ))?;
         }
 
-        let rejected = handle_admin_command(AdminCommand::Reject { request_id }, &pending_reviews)?;
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let rejected = handle_admin_command(
+            AdminCommand::Reject { request_id },
+            &pending_reviews,
+            &filesystem,
+        )?;
 
         assert_eq!(rejected.request_id, request_id);
         assert_eq!(rejected.purpose, "Update application configuration");
@@ -1669,6 +1833,62 @@ mod gateway_tests {
         assert_eq!(json["executed"], true);
         assert_eq!(json["execution_outcome"], "Success");
         assert_eq!(json["result"]["value"], 5);
+
+        Ok(())
+    }
+    #[test]
+    fn valid_approval_revalidation_still_does_not_execute_write() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-approval-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let target = workspace.join("approved.txt");
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "approved.txt".to_owned(),
+                    content: "approved content".to_owned(),
+                }),
+                "Test valid approval revalidation".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::new(workspace.clone());
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert_eq!(result, Err("admin approval is not enabled".to_owned()));
+
+        assert!(!target.exists());
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+        assert_eq!(store.len(), 1);
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
 
         Ok(())
     }
