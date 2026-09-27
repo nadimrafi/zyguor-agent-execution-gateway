@@ -10,7 +10,8 @@ use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArgu
 use filesystem::FileSystemCapability;
 use pending_review::{PendingReview, PendingReviewStore};
 use policy::{
-    PolicyDecision, PolicyEvaluation, PolicyOperation, block_out_of_scope, evaluate_operation,
+    PolicyDecision, PolicyEvaluation, PolicyOperation, PolicyReason, block_out_of_scope,
+    evaluate_operation,
 };
 use sandbox::{SandboxConfig, SandboxExecutor};
 use std::os::unix::fs::PermissionsExt;
@@ -62,6 +63,15 @@ enum ExecutionResult {
     Integer { value: i32 },
     Text { content: String },
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovedWriteOutcome {
+    Success,
+    WriteFailed(String),
+    CompletionAuditFailed {
+        execution_outcome: ExecutionOutcome,
+        error: String,
+    },
+}
 
 #[derive(Debug, serde::Serialize)]
 struct GatewayResponse<'a> {
@@ -84,6 +94,25 @@ enum AdminCommand {
     Approve { request_id: uuid::Uuid },
     Reject { request_id: uuid::Uuid },
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminOutcome {
+    Approved {
+        request_id: uuid::Uuid,
+    },
+    Rejected {
+        pending: PendingReview,
+    },
+    WriteFailed {
+        request_id: uuid::Uuid,
+        error: String,
+    },
+    CompletionAuditFailed {
+        request_id: uuid::Uuid,
+        execution_outcome: ExecutionOutcome,
+        error: String,
+    },
+}
+
 fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
     let trimmed = input.trim();
 
@@ -324,12 +353,89 @@ fn revalidate_pending_request(
         _ => Err("pending request is not eligible for approval".to_owned()),
     }
 }
+fn write_approval_audit<F>(pending: &PendingReview, mut audit_writer: F) -> Result<(), String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+{
+    let record = AuditRecord::new(
+        pending.request_id,
+        &pending.purpose,
+        PolicyDecision::Review,
+        PolicyReason::Write,
+        AuditPhase::Approval,
+        ExecutionOutcome::NotExecuted,
+    )
+    .map_err(|error| format!("failed to create approval audit record: {error}"))?;
 
+    audit_writer(&record).map_err(|error| format!("failed to persist approval audit: {error}"))
+}
+
+fn persist_approval_audit(pending: &PendingReview) -> Result<(), String> {
+    write_approval_audit(pending, persist_audit)
+}
+fn execute_approved_write<F, W>(
+    pending: &PendingReview,
+    mut audit_writer: F,
+    write_operation: W,
+) -> Result<ApprovedWriteOutcome, String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+    W: FnOnce() -> Result<(), String>,
+{
+    let pre_execution_record = AuditRecord::new(
+        pending.request_id,
+        &pending.purpose,
+        PolicyDecision::Review,
+        PolicyReason::Write,
+        AuditPhase::PreExecution,
+        ExecutionOutcome::NotExecuted,
+    )
+    .map_err(|error| format!("failed to create pre-execution audit record: {error}"))?;
+
+    audit_writer(&pre_execution_record)
+        .map_err(|error| format!("failed to persist pre-execution audit: {error}"))?;
+
+    let write_result = write_operation();
+
+    let execution_outcome = match &write_result {
+        Ok(()) => ExecutionOutcome::Success,
+        Err(_) => ExecutionOutcome::Failed,
+    };
+
+    let completion_record = match AuditRecord::new(
+        pending.request_id,
+        &pending.purpose,
+        PolicyDecision::Review,
+        PolicyReason::Write,
+        AuditPhase::Completion,
+        execution_outcome,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+                execution_outcome,
+                error: format!("failed to create completion audit record: {error}"),
+            });
+        }
+    };
+
+    if let Err(error) = audit_writer(&completion_record) {
+        return Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+            execution_outcome,
+            error,
+        });
+    }
+
+    match write_result {
+        Ok(()) => Ok(ApprovedWriteOutcome::Success),
+        Err(error) => Ok(ApprovedWriteOutcome::WriteFailed(error)),
+    }
+}
 fn handle_admin_command(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
-) -> Result<PendingReview, String> {
+) -> Result<AdminOutcome, String> {
     match command {
         AdminCommand::Approve { request_id } => {
             let pending = inspect_pending_request(request_id, pending_reviews)?;
@@ -340,11 +446,41 @@ fn handle_admin_command(
                 .lock()
                 .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-            let _claimed = store.claim(&request_id)?;
+            let claimed = store.claim(&request_id)?;
 
-            Err("admin approval execution is not enabled".to_owned())
+            drop(store);
+
+            persist_approval_audit(&claimed)?;
+
+            match &claimed.request {
+                ExecutionRequest::WriteFile(arguments) => {
+                    let outcome = execute_approved_write(&claimed, persist_audit, || {
+                        filesystem.write_text_file(&arguments.path, &arguments.content)
+                    })?;
+
+                    match outcome {
+                        ApprovedWriteOutcome::Success => Ok(AdminOutcome::Approved { request_id }),
+                        ApprovedWriteOutcome::WriteFailed(error) => {
+                            Ok(AdminOutcome::WriteFailed { request_id, error })
+                        }
+                        ApprovedWriteOutcome::CompletionAuditFailed {
+                            execution_outcome,
+                            error,
+                        } => Ok(AdminOutcome::CompletionAuditFailed {
+                            request_id,
+                            execution_outcome,
+                            error,
+                        }),
+                    }
+                }
+                _ => Err("claimed request is not eligible for approval".to_owned()),
+            }
         }
-        AdminCommand::Reject { request_id } => reject_pending_request(request_id, pending_reviews),
+        AdminCommand::Reject { request_id } => {
+            let pending = reject_pending_request(request_id, pending_reviews)?;
+
+            Ok(AdminOutcome::Rejected { pending })
+        }
     }
 }
 
@@ -422,7 +558,7 @@ async fn handle_admin_connection(
     stream: tokio::net::UnixStream,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
-) -> Result<PendingReview, String> {
+) -> Result<AdminOutcome, String> {
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
     let mut input = String::new();
@@ -472,7 +608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pending_reviews = Arc::new(Mutex::new(PendingReviewStore::new()));
 
-    let filesystem = FileSystemCapability::new(workspace_root.into());
+    let filesystem = FileSystemCapability::try_new(workspace_root.into())?;
 
     let gateway = ZyguorGateway {
         filesystem: filesystem.clone(),
@@ -498,12 +634,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod gateway_tests {
     use super::ExecutionResult;
     use super::{
-        AddArguments, AdminCommand, ExecuteParams, ExecutionArgumentsParams,
-        ExecutionContextParams, ExecutionRequest, FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH,
-        MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation, ReadFileArguments,
-        WriteFileArguments, build_execution_request, create_admin_listener, evaluate_request,
-        execute_message_with_audit_id, execute_request, handle_admin_command,
-        handle_admin_connection, parse_admin_command, reject_pending_request,
+        AddArguments, AdminCommand, AdminOutcome, ApprovedWriteOutcome, AuditPhase, ExecuteParams,
+        ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
+        FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision,
+        PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
+        create_admin_listener, evaluate_request, execute_message_with_audit_id, execute_request,
+        handle_admin_command, handle_admin_connection, parse_admin_command, reject_pending_request,
         run_infinite_loop_with_fuel,
     };
     use crate::pending_review::PendingReviewStore;
@@ -609,7 +745,11 @@ mod gateway_tests {
             .await
             .map_err(|error| format!("admin client task failed: {error}"))??;
 
-        assert_eq!(rejected.request_id, request_id);
+        let AdminOutcome::Rejected { pending } = rejected else {
+            return Err("expected rejected admin outcome".to_owned());
+        };
+
+        assert_eq!(pending.request_id, request_id);
 
         {
             let store = pending_reviews
@@ -801,7 +941,7 @@ mod gateway_tests {
         );
     }
     #[test]
-    fn valid_approval_claims_pending_request_without_execution() -> Result<(), String> {
+    fn valid_approval_claims_and_consumes_pending_request() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
         let pending_reviews = empty_pending_review_store();
 
@@ -821,33 +961,36 @@ mod gateway_tests {
         }
 
         let workspace =
-            std::env::temp_dir().join(format!("zyguor-disabled-approval-test-{request_id}"));
+            std::env::temp_dir().join(format!("zyguor-approval-claim-test-{request_id}"));
 
         let config_dir = workspace.join("config");
 
         std::fs::create_dir_all(&config_dir)
             .map_err(|error| format!("failed to create test workspace: {error}"))?;
 
-        let filesystem = FileSystemCapability::new(workspace.clone());
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
         let result = handle_admin_command(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
         );
 
-        assert_eq!(
-            result,
-            Err("admin approval execution is not enabled".to_owned())
-        );
+        assert_eq!(result, Ok(AdminOutcome::Approved { request_id }));
 
         let target = workspace.join("config/settings.txt");
+
+        let written_content = std::fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read approved test file: {error}"))?;
+
+        assert_eq!(written_content, "enabled=true");
+
         let store = pending_reviews
             .lock()
             .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
         assert!(store.get(&request_id).is_none());
         assert!(store.is_empty());
-        assert!(!target.exists());
 
         drop(store);
 
@@ -971,8 +1114,12 @@ mod gateway_tests {
             &filesystem,
         )?;
 
-        assert_eq!(rejected.request_id, request_id);
-        assert_eq!(rejected.purpose, "Update application configuration");
+        let AdminOutcome::Rejected { pending } = rejected else {
+            return Err("expected rejected admin outcome".to_owned());
+        };
+
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.purpose, "Update application configuration");
 
         let second_rejection = reject_pending_request(request_id, &pending_reviews);
 
@@ -1848,7 +1995,95 @@ mod gateway_tests {
         Ok(())
     }
     #[test]
-    fn valid_approval_revalidation_still_does_not_execute_write() -> Result<(), String> {
+    fn approved_write_records_failed_completion() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test approved write failure audit".to_owned(),
+        );
+
+        let mut records = Vec::new();
+
+        let result = super::execute_approved_write(
+            &pending,
+            |record| {
+                records.push((record.phase, record.execution_outcome));
+                Ok(())
+            },
+            || Err("simulated write failure".to_owned()),
+        );
+
+        assert_eq!(
+            result,
+            Ok(ApprovedWriteOutcome::WriteFailed(
+                "simulated write failure".to_owned()
+            ))
+        );
+
+        assert_eq!(
+            records,
+            vec![
+                (AuditPhase::PreExecution, ExecutionOutcome::NotExecuted),
+                (AuditPhase::Completion, ExecutionOutcome::Failed),
+            ]
+        );
+
+        Ok(())
+    }
+    #[test]
+    fn approved_write_distinguishes_completion_audit_failure_after_success() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test completion audit failure".to_owned(),
+        );
+
+        let mut audit_count = 0;
+        let mut write_called = false;
+
+        let result = super::execute_approved_write(
+            &pending,
+            |_| {
+                audit_count += 1;
+
+                if audit_count == 2 {
+                    return Err("simulated completion audit failure".to_owned());
+                }
+
+                Ok(())
+            },
+            || {
+                write_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(write_called);
+        assert_eq!(audit_count, 2);
+
+        assert_eq!(
+            result,
+            Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+                execution_outcome: ExecutionOutcome::Success,
+                error: "simulated completion audit failure".to_owned(),
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn valid_approval_executes_secure_write() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
         let pending_reviews = empty_pending_review_store();
 
@@ -1873,11 +2108,11 @@ mod gateway_tests {
                     path: "approved.txt".to_owned(),
                     content: "approved content".to_owned(),
                 }),
-                "Test valid approval revalidation".to_owned(),
+                "Test valid approval execution".to_owned(),
             ))?;
         }
 
-        let filesystem = FileSystemCapability::new(workspace.clone());
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
 
         let result = handle_admin_command(
             AdminCommand::Approve { request_id },
@@ -1885,12 +2120,12 @@ mod gateway_tests {
             &filesystem,
         );
 
-        assert_eq!(
-            result,
-            Err("admin approval execution is not enabled".to_owned())
-        );
+        assert_eq!(result, Ok(AdminOutcome::Approved { request_id }));
 
-        assert!(!target.exists());
+        let written_content = std::fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read approved test file: {error}"))?;
+
+        assert_eq!(written_content, "approved content");
 
         let store = pending_reviews
             .lock()
@@ -1902,6 +2137,30 @@ mod gateway_tests {
 
         std::fs::remove_dir_all(&workspace)
             .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn approval_audit_failure_is_propagated() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test approval audit failure".to_owned(),
+        );
+
+        let result = super::write_approval_audit(&pending, |_| {
+            Err("simulated approval audit failure".to_owned())
+        });
+
+        assert_eq!(
+            result,
+            Err("failed to persist approval audit: simulated approval audit failure".to_owned())
+        );
 
         Ok(())
     }
@@ -1934,6 +2193,107 @@ mod gateway_tests {
         assert_eq!(json["executed"], false);
         assert_eq!(json["execution_outcome"], "Failed");
         assert!(json["result"].is_null());
+
+        Ok(())
+    }
+    #[test]
+    fn approved_write_does_not_execute_when_pre_execution_audit_fails() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test approved write audit gate".to_owned(),
+        );
+
+        let mut write_called = false;
+
+        let result = super::execute_approved_write(
+            &pending,
+            |_| Err("simulated pre-execution audit failure".to_owned()),
+            || {
+                write_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(
+                "failed to persist pre-execution audit: simulated pre-execution audit failure"
+                    .to_owned()
+            )
+        );
+
+        assert!(!write_called);
+
+        Ok(())
+    }
+    #[test]
+    fn approved_write_executes_after_pre_execution_audit_succeeds() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test approved write execution".to_owned(),
+        );
+
+        let mut write_count = 0;
+
+        let result = super::execute_approved_write(
+            &pending,
+            |_| Ok(()),
+            || {
+                write_count += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(ApprovedWriteOutcome::Success));
+        assert_eq!(write_count, 1);
+
+        Ok(())
+    }
+    #[test]
+    fn approved_write_records_successful_completion() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = crate::pending_review::PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test approved write completion audit".to_owned(),
+        );
+
+        let mut records = Vec::new();
+
+        let result = super::execute_approved_write(
+            &pending,
+            |record| {
+                records.push((record.phase, record.execution_outcome));
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert_eq!(result, Ok(ApprovedWriteOutcome::Success));
+
+        assert_eq!(
+            records,
+            vec![
+                (AuditPhase::PreExecution, ExecutionOutcome::NotExecuted),
+                (AuditPhase::Completion, ExecutionOutcome::Success),
+            ]
+        );
 
         Ok(())
     }

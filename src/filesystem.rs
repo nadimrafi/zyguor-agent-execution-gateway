@@ -1,17 +1,36 @@
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 const MAX_READ_BYTES: u64 = 1024 * 1024;
+const MAX_WRITE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FileSystemCapability {
     workspace_root: PathBuf,
+    workspace_dir: Option<Arc<Dir>>,
 }
 
 impl FileSystemCapability {
+    #[cfg(test)]
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+        Self {
+            workspace_root,
+            workspace_dir: None,
+        }
+    }
+    pub fn try_new(workspace_root: PathBuf) -> Result<Self, String> {
+        let workspace_dir = Dir::open_ambient_dir(&workspace_root, ambient_authority())
+            .map_err(|error| format!("failed to open workspace capability: {error}"))?;
+
+        Ok(Self {
+            workspace_root,
+            workspace_dir: Some(Arc::new(workspace_dir)),
+        })
     }
 
     pub fn validate_relative_path(&self, requested_path: &str) -> Result<PathBuf, String> {
@@ -96,6 +115,47 @@ impl FileSystemCapability {
 
         Ok(canonical_parent.join(file_name))
     }
+    pub fn write_text_file(&self, requested_path: &str, content: &str) -> Result<(), String> {
+        if content.len() > MAX_WRITE_BYTES {
+            return Err(format!(
+                "write content exceeds maximum size of {MAX_WRITE_BYTES} bytes"
+            ));
+        }
+        let relative_path = Path::new(requested_path);
+
+        if relative_path.is_absolute() {
+            return Err("absolute paths are not allowed".to_owned());
+        }
+
+        for component in relative_path.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err("parent directory traversal is not allowed".to_owned());
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("path must remain inside the workspace".to_owned());
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+
+        let workspace = self
+            .workspace_dir
+            .as_ref()
+            .ok_or_else(|| "secure write requires an anchored workspace capability".to_owned())?;
+
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+
+        options.follow(FollowSymlinks::No);
+
+        let mut file = workspace
+            .open_with(relative_path, &options)
+            .map_err(|error| format!("failed to open requested file for writing: {error}"))?;
+
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("failed to write requested file: {error}"))
+    }
 
     pub fn read_text_file(&self, requested_path: &str) -> Result<String, String> {
         let resolved_path = self.resolve_existing_path(requested_path)?;
@@ -119,9 +179,10 @@ impl FileSystemCapability {
             .map_err(|error| format!("requested file is not valid UTF-8: {error}"))
     }
 }
+
 #[cfg(test)]
 mod tests {
-    use super::{FileSystemCapability, MAX_READ_BYTES};
+    use super::{FileSystemCapability, MAX_READ_BYTES, MAX_WRITE_BYTES};
     use std::path::PathBuf;
 
     #[test]
@@ -196,7 +257,7 @@ mod tests {
         symlink(&outside_file, &workspace_link)
             .map_err(|error| format!("failed to create test symlink: {error}"))?;
 
-        let capability = FileSystemCapability::new(workspace);
+        let capability = FileSystemCapability::try_new(workspace)?;
 
         let result = capability.resolve_existing_path("escape");
 
@@ -542,6 +603,374 @@ mod tests {
         let error = result.expect_err("broken final symlink should be rejected");
 
         assert!(error.starts_with("failed to resolve requested path:"));
+
+        Ok(())
+    }
+    #[test]
+    fn securely_writes_new_file_inside_workspace() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-secure-write-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let config_dir = workspace.join("config");
+
+        fs::create_dir_all(&config_dir)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace.clone())?;
+
+        capability.write_text_file("config/settings.txt", "enabled=true")?;
+
+        let content = fs::read_to_string(workspace.join("config/settings.txt"))
+            .map_err(|error| format!("failed to read written test file: {error}"))?;
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(content, "enabled=true");
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_rejects_parent_directory_traversal() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-traversal-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside_file = test_root.join("outside.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+
+        let result = capability.write_text_file("../outside.txt", "must-not-be-written");
+
+        assert_eq!(
+            result,
+            Err("parent directory traversal is not allowed".to_owned())
+        );
+        assert!(!outside_file.exists());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_rejects_symlink_escape_outside_workspace() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-symlink-escape-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside_file = test_root.join("outside.txt");
+        let symlink_path = workspace.join("escape.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&outside_file, "original")
+            .map_err(|error| format!("failed to create outside test file: {error}"))?;
+
+        symlink(&outside_file, &symlink_path)
+            .map_err(|error| format!("failed to create test symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.write_text_file("escape.txt", "must-not-be-written");
+
+        assert!(result.is_err());
+
+        let outside_content = fs::read_to_string(&outside_file)
+            .map_err(|error| format!("failed to read outside test file: {error}"))?;
+
+        assert_eq!(outside_content, "original");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_rejects_parent_symlink_escape_outside_workspace() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-parent-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside_dir = test_root.join("outside");
+        let outside_file = outside_dir.join("settings.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&outside_dir)
+            .map_err(|error| format!("failed to create outside directory: {error}"))?;
+
+        fs::write(&outside_file, "original")
+            .map_err(|error| format!("failed to create outside test file: {error}"))?;
+
+        symlink(&outside_dir, workspace.join("config"))
+            .map_err(|error| format!("failed to create parent symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.write_text_file("config/settings.txt", "must-not-be-written");
+
+        assert!(result.is_err());
+
+        let outside_content = fs::read_to_string(&outside_file)
+            .map_err(|error| format!("failed to read outside test file: {error}"))?;
+
+        assert_eq!(outside_content, "original");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_rejects_internal_parent_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-internal-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let real_dir = workspace.join("real-config");
+
+        fs::create_dir_all(&real_dir)
+            .map_err(|error| format!("failed to create real directory: {error}"))?;
+
+        fs::write(real_dir.join("settings.txt"), "original")
+            .map_err(|error| format!("failed to create test file: {error}"))?;
+
+        symlink(&real_dir, workspace.join("config"))
+            .map_err(|error| format!("failed to create internal symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = capability.write_text_file("config/settings.txt", "updated");
+
+        let content = fs::read_to_string(real_dir.join("settings.txt"))
+            .map_err(|error| format!("failed to read test file: {error}"))?;
+
+        assert!(result.is_err());
+        assert_eq!(content, "original");
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_rejects_internal_final_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-final-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let real_file = workspace.join("real.txt");
+        let alias_file = workspace.join("alias.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&real_file, "original")
+            .map_err(|error| format!("failed to create real test file: {error}"))?;
+
+        symlink("real.txt", &alias_file)
+            .map_err(|error| format!("failed to create internal symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.write_text_file("alias.txt", "must-not-be-written");
+
+        assert!(result.is_err());
+
+        let content = fs::read_to_string(&real_file)
+            .map_err(|error| format!("failed to read real test file: {error}"))?;
+
+        assert_eq!(content, "original");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_rejects_content_over_maximum_size() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-size-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target = workspace.join("large.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let capability = FileSystemCapability::new(workspace);
+        let oversized_content = "a".repeat(MAX_WRITE_BYTES + 1);
+
+        let result = capability.write_text_file("large.txt", &oversized_content);
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "write content exceeds maximum size of {MAX_WRITE_BYTES} bytes"
+            ))
+        );
+
+        assert!(!target.exists());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_accepts_content_at_maximum_size() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-max-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target = workspace.join("maximum.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+        let content = "a".repeat(MAX_WRITE_BYTES);
+
+        capability.write_text_file("maximum.txt", &content)?;
+
+        let written =
+            fs::read(&target).map_err(|error| format!("failed to read written file: {error}"))?;
+
+        assert_eq!(written.len(), MAX_WRITE_BYTES);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_overwrites_existing_regular_file() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-overwrite-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target = workspace.join("settings.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&target, "old-value")
+            .map_err(|error| format!("failed to create existing file: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        capability.write_text_file("settings.txt", "new-value")?;
+
+        let written = fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read overwritten file: {error}"))?;
+
+        assert_eq!(written, "new-value");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_rejects_missing_parent_directory() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-missing-parent-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = capability.write_text_file("missing/settings.txt", "enabled=true");
+
+        assert!(result.is_err());
+        assert!(!workspace.join("missing").exists());
+        assert!(!workspace.join("missing/settings.txt").exists());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_write_rejects_directory_target() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-directory-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target_directory = workspace.join("config");
+
+        fs::create_dir_all(&target_directory)
+            .map_err(|error| format!("failed to create target directory: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.write_text_file("config", "must-not-be-written");
+
+        assert!(result.is_err());
+        assert!(target_directory.is_dir());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
 
         Ok(())
     }
