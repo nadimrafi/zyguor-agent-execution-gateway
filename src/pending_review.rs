@@ -46,6 +46,11 @@ impl PendingReviewStore {
     pub fn get(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.reviews.get(request_id)
     }
+    pub fn claim(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
+        self.reviews
+            .remove(request_id)
+            .ok_or_else(|| "pending review request not found".to_owned())
+    }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -88,6 +93,37 @@ mod tests {
 
         assert!(stored.is_some());
         assert_eq!(stored.map(|review| &review.request), Some(&request));
+    }
+
+    #[test]
+    fn claiming_pending_review_is_single_use() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+
+        store.insert(pending.clone())?;
+
+        let claimed = store.claim(&request_id)?;
+
+        assert_eq!(claimed, pending);
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        assert_eq!(
+            store.claim(&request_id),
+            Err("pending review request not found".to_owned())
+        );
+
+        Ok(())
     }
 
     #[test]

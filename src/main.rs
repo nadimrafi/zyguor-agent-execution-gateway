@@ -336,7 +336,13 @@ fn handle_admin_command(
 
             revalidate_pending_request(&pending, filesystem)?;
 
-            Err("admin approval is not enabled".to_owned())
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            let _claimed = store.claim(&request_id)?;
+
+            Err("admin approval execution is not enabled".to_owned())
         }
         AdminCommand::Reject { request_id } => reject_pending_request(request_id, pending_reviews),
     }
@@ -795,7 +801,7 @@ mod gateway_tests {
         );
     }
     #[test]
-    fn disabled_approval_does_not_consume_pending_request() -> Result<(), String> {
+    fn valid_approval_claims_pending_request_without_execution() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
         let pending_reviews = empty_pending_review_store();
 
@@ -829,14 +835,19 @@ mod gateway_tests {
             &filesystem,
         );
 
-        assert_eq!(result, Err("admin approval is not enabled".to_owned()));
+        assert_eq!(
+            result,
+            Err("admin approval execution is not enabled".to_owned())
+        );
 
+        let target = workspace.join("config/settings.txt");
         let store = pending_reviews
             .lock()
             .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-        assert!(store.get(&request_id).is_some());
-        assert_eq!(store.len(), 1);
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+        assert!(!target.exists());
 
         drop(store);
 
@@ -1874,7 +1885,10 @@ mod gateway_tests {
             &filesystem,
         );
 
-        assert_eq!(result, Err("admin approval is not enabled".to_owned()));
+        assert_eq!(
+            result,
+            Err("admin approval execution is not enabled".to_owned())
+        );
 
         assert!(!target.exists());
 
@@ -1882,9 +1896,8 @@ mod gateway_tests {
             .lock()
             .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-        assert!(store.get(&request_id).is_some());
-        assert_eq!(store.len(), 1);
-
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
         drop(store);
 
         std::fs::remove_dir_all(&workspace)
