@@ -51,6 +51,15 @@ impl PendingReviewStore {
             .remove(request_id)
             .ok_or_else(|| "pending review request not found".to_owned())
     }
+    pub fn restore_claimed(&mut self, pending: PendingReview) -> Result<(), String> {
+        if self.reviews.contains_key(&pending.request_id) {
+            return Err("pending review request ID already exists".to_owned());
+        }
+
+        self.reviews.insert(pending.request_id, pending);
+
+        Ok(())
+    }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -210,5 +219,70 @@ mod tests {
         let second_take = store.take(&request_id);
 
         assert_eq!(second_take, None);
+    }
+    #[test]
+    fn restores_claimed_review_for_safe_retry() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+
+        store.insert(pending.clone())?;
+
+        let claimed = store.claim(&request_id)?;
+
+        assert!(store.get(&request_id).is_none());
+
+        store.restore_claimed(claimed)?;
+
+        assert_eq!(store.get(&request_id), Some(&pending));
+        assert_eq!(store.len(), 1);
+
+        Ok(())
+    }
+    #[test]
+    fn restore_claimed_refuses_to_replace_existing_review() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let original = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/original.txt".to_owned(),
+                content: "original".to_owned(),
+            }),
+            "Original request".to_owned(),
+        );
+
+        let replacement = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/replacement.txt".to_owned(),
+                content: "replacement".to_owned(),
+            }),
+            "Replacement request".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+
+        store.insert(original.clone())?;
+
+        let result = store.restore_claimed(replacement);
+
+        assert_eq!(
+            result,
+            Err("pending review request ID already exists".to_owned())
+        );
+        assert_eq!(store.get(&request_id), Some(&original));
+        assert_eq!(store.len(), 1);
+
+        Ok(())
     }
 }

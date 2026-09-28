@@ -340,6 +340,16 @@ fn inspect_pending_request(
         .cloned()
         .ok_or_else(|| "pending review request not found".to_owned())
 }
+fn restore_claimed_request(
+    pending: PendingReview,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<(), String> {
+    let mut store = pending_reviews
+        .lock()
+        .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+    store.restore_claimed(pending)
+}
 fn revalidate_pending_request(
     pending: &PendingReview,
     filesystem: &FileSystemCapability,
@@ -369,8 +379,23 @@ where
     audit_writer(&record).map_err(|error| format!("failed to persist approval audit: {error}"))
 }
 
-fn persist_approval_audit(pending: &PendingReview) -> Result<(), String> {
-    write_approval_audit(pending, persist_audit)
+fn audit_claimed_approval<F>(
+    claimed: &PendingReview,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    audit_writer: F,
+) -> Result<(), String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+{
+    if let Err(audit_error) = write_approval_audit(claimed, audit_writer) {
+        restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
+            format!("{audit_error}; failed to restore claimed request: {restore_error}")
+        })?;
+
+        return Err(audit_error);
+    }
+
+    Ok(())
 }
 fn execute_approved_write<F, W>(
     pending: &PendingReview,
@@ -430,6 +455,27 @@ where
         Err(error) => Ok(ApprovedWriteOutcome::WriteFailed(error)),
     }
 }
+fn execute_claimed_write<F, W>(
+    claimed: &PendingReview,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    audit_writer: F,
+    write_operation: W,
+) -> Result<ApprovedWriteOutcome, String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+    W: FnOnce() -> Result<(), String>,
+{
+    match execute_approved_write(claimed, audit_writer, write_operation) {
+        Ok(outcome) => Ok(outcome),
+        Err(execution_error) => {
+            restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
+                format!("{execution_error}; failed to restore claimed request: {restore_error}")
+            })?;
+
+            Err(execution_error)
+        }
+    }
+}
 fn handle_admin_command(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
@@ -449,14 +495,14 @@ fn handle_admin_command(
 
             drop(store);
 
-            persist_approval_audit(&claimed)?;
+            audit_claimed_approval(&claimed, pending_reviews, persist_audit)?;
 
             match &claimed.request {
                 ExecutionRequest::WriteFile(arguments) => {
-                    let outcome = execute_approved_write(&claimed, persist_audit, || {
-                        filesystem.write_text_file(&arguments.path, &arguments.content)
-                    })?;
-
+                    let outcome =
+                        execute_claimed_write(&claimed, pending_reviews, persist_audit, || {
+                            filesystem.write_text_file(&arguments.path, &arguments.content)
+                        })?;
                     match outcome {
                         ApprovedWriteOutcome::Success => Ok(AdminOutcome::Approved { request_id }),
                         ApprovedWriteOutcome::WriteFailed(error) => {
@@ -636,12 +682,13 @@ mod gateway_tests {
         AddArguments, AdminCommand, AdminOutcome, ApprovedWriteOutcome, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
         FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision,
-        PolicyEvaluation, ReadFileArguments, WriteFileArguments, build_execution_request,
-        create_admin_listener, evaluate_request, execute_message_with_audit_id, execute_request,
-        handle_admin_command, handle_admin_connection, parse_admin_command, reject_pending_request,
+        PolicyEvaluation, ReadFileArguments, WriteFileArguments, audit_claimed_approval,
+        build_execution_request, create_admin_listener, evaluate_request,
+        execute_message_with_audit_id, execute_request, handle_admin_command,
+        handle_admin_connection, parse_admin_command, reject_pending_request,
         run_infinite_loop_with_fuel,
     };
-    use crate::pending_review::PendingReviewStore;
+    use crate::pending_review::{PendingReview, PendingReviewStore};
     use crate::policy::evaluate_message;
     use std::sync::{Arc, Mutex};
 
@@ -2163,6 +2210,52 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn approval_audit_failure_restores_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+
+            let claimed = store.claim(&request_id)?;
+
+            assert!(store.get(&request_id).is_none());
+
+            drop(store);
+
+            let result = audit_claimed_approval(&claimed, &pending_reviews, |_| {
+                Err("simulated audit failure".to_owned())
+            });
+
+            assert_eq!(
+                result,
+                Err("failed to persist approval audit: simulated audit failure".to_owned())
+            );
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert_eq!(store.get(&request_id), Some(&pending));
+        assert_eq!(store.len(), 1);
+
+        Ok(())
+    }
 
     #[test]
     fn completion_audit_failure_preserves_failed_execution() -> Result<(), String> {
@@ -2231,6 +2324,186 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn pre_execution_audit_failure_restores_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test pre-execution failure restoration".to_owned(),
+        );
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+
+            let claimed = store.claim(&request_id)?;
+
+            assert!(store.get(&request_id).is_none());
+
+            drop(store);
+
+            let mut write_called = false;
+
+            let result = super::execute_claimed_write(
+                &claimed,
+                &pending_reviews,
+                |_| Err("simulated pre-execution audit failure".to_owned()),
+                || {
+                    write_called = true;
+                    Ok(())
+                },
+            );
+
+            assert_eq!(
+                result,
+                Err(
+                    "failed to persist pre-execution audit: simulated pre-execution audit failure"
+                        .to_owned()
+                )
+            );
+
+            assert!(!write_called);
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert_eq!(store.get(&request_id), Some(&pending));
+        assert_eq!(store.len(), 1);
+
+        Ok(())
+    }
+    #[test]
+    fn write_failure_does_not_restore_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test failed write remains consumed".to_owned(),
+        );
+
+        let claimed = {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending)?;
+
+            store.claim(&request_id)?
+        };
+
+        let mut write_called = false;
+
+        let result = super::execute_claimed_write(
+            &claimed,
+            &pending_reviews,
+            |_| Ok(()),
+            || {
+                write_called = true;
+                Err("simulated write failure".to_owned())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Ok(ApprovedWriteOutcome::WriteFailed(
+                "simulated write failure".to_owned()
+            ))
+        );
+
+        assert!(write_called);
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        Ok(())
+    }
+    #[test]
+    fn completion_audit_failure_after_success_does_not_restore_claimed_request()
+    -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "approved.txt".to_owned(),
+                content: "approved content".to_owned(),
+            }),
+            "Test completion audit failure remains consumed".to_owned(),
+        );
+
+        let claimed = {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending)?;
+
+            store.claim(&request_id)?
+        };
+
+        let mut audit_calls = 0;
+        let mut write_called = false;
+
+        let result = super::execute_claimed_write(
+            &claimed,
+            &pending_reviews,
+            |_| {
+                audit_calls += 1;
+
+                if audit_calls == 1 {
+                    Ok(())
+                } else {
+                    Err("simulated completion audit failure".to_owned())
+                }
+            },
+            || {
+                write_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+                execution_outcome: ExecutionOutcome::Success,
+                error: "simulated completion audit failure".to_owned(),
+            })
+        );
+
+        assert!(write_called);
+        assert_eq!(audit_calls, 2);
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        Ok(())
+    }
+
     #[test]
     fn approved_write_executes_after_pre_execution_audit_succeeds() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
