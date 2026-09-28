@@ -378,6 +378,40 @@ where
 
     audit_writer(&record).map_err(|error| format!("failed to persist approval audit: {error}"))
 }
+fn write_rejection_audit<F>(pending: &PendingReview, mut audit_writer: F) -> Result<(), String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+{
+    let record = AuditRecord::new(
+        pending.request_id,
+        &pending.purpose,
+        PolicyDecision::Review,
+        PolicyReason::Write,
+        AuditPhase::Rejection,
+        ExecutionOutcome::NotExecuted,
+    )
+    .map_err(|error| format!("failed to create rejection audit record: {error}"))?;
+
+    audit_writer(&record).map_err(|error| format!("failed to persist rejection audit: {error}"))
+}
+fn audit_claimed_rejection<F>(
+    claimed: &PendingReview,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    audit_writer: F,
+) -> Result<(), String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+{
+    if let Err(audit_error) = write_rejection_audit(claimed, audit_writer) {
+        restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
+            format!("{audit_error}; failed to restore claimed request: {restore_error}")
+        })?;
+
+        return Err(audit_error);
+    }
+
+    Ok(())
+}
 
 fn audit_claimed_approval<F>(
     claimed: &PendingReview,
@@ -523,6 +557,8 @@ fn handle_admin_command(
         }
         AdminCommand::Reject { request_id } => {
             let pending = reject_pending_request(request_id, pending_reviews)?;
+
+            audit_claimed_rejection(&pending, pending_reviews, persist_audit)?;
 
             Ok(AdminOutcome::Rejected { pending })
         }
@@ -1130,6 +1166,40 @@ mod gateway_tests {
                 panic!("expected Add execution request");
             }
         }
+
+        Ok(())
+    }
+    #[test]
+    fn successful_rejection_audit_keeps_request_consumed() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let claimed = {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending)?;
+            store.claim(&request_id)?
+        };
+
+        super::audit_claimed_rejection(&claimed, &pending_reviews, |_| Ok(()))?;
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
 
         Ok(())
     }
@@ -2207,6 +2277,95 @@ mod gateway_tests {
             result,
             Err("failed to persist approval audit: simulated approval audit failure".to_owned())
         );
+
+        Ok(())
+    }
+    #[test]
+    fn rejection_audit_records_human_rejection() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut observed = None;
+
+        super::write_rejection_audit(&pending, |record| {
+            observed = Some((
+                record.request_id,
+                record.decision,
+                record.reason,
+                record.phase,
+                record.execution_outcome,
+            ));
+
+            Ok(())
+        })?;
+
+        assert_eq!(
+            observed,
+            Some((
+                request_id,
+                PolicyDecision::Review,
+                crate::policy::PolicyReason::Write,
+                AuditPhase::Rejection,
+                ExecutionOutcome::NotExecuted,
+            ))
+        );
+
+        Ok(())
+    }
+    #[test]
+    fn rejection_audit_failure_restores_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+
+            let claimed = store.claim(&request_id)?;
+
+            assert!(store.get(&request_id).is_none());
+
+            drop(store);
+
+            let result = super::audit_claimed_rejection(&claimed, &pending_reviews, |_| {
+                Err("simulated rejection audit failure".to_owned())
+            });
+
+            assert_eq!(
+                result,
+                Err(
+                    "failed to persist rejection audit: simulated rejection audit failure"
+                        .to_owned()
+                )
+            );
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert_eq!(store.get(&request_id), Some(&pending));
+        assert_eq!(store.len(), 1);
 
         Ok(())
     }

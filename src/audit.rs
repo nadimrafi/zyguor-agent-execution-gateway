@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum AuditPhase {
     Approval,
+    Rejection,
     PreExecution,
     Completion,
 }
