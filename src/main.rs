@@ -346,8 +346,7 @@ fn revalidate_pending_request(
 ) -> Result<(), String> {
     match &pending.request {
         ExecutionRequest::WriteFile(arguments) => filesystem
-            .resolve_write_target(&arguments.path)
-            .map(|_| ())
+            .revalidate_write_target(&arguments.path)
             .map_err(|error| format!("pending write target is no longer valid: {error}")),
 
         _ => Err("pending request is not eligible for approval".to_owned()),

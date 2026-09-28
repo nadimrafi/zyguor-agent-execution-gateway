@@ -1,4 +1,4 @@
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use std::fs::File;
@@ -115,6 +115,60 @@ impl FileSystemCapability {
 
         Ok(canonical_parent.join(file_name))
     }
+    pub fn revalidate_write_target(&self, requested_path: &str) -> Result<(), String> {
+        let relative_path = Path::new(requested_path);
+
+        if relative_path.is_absolute() {
+            return Err("absolute paths are not allowed".to_owned());
+        }
+
+        for component in relative_path.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err("parent directory traversal is not allowed".to_owned());
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("path must remain inside the workspace".to_owned());
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+
+        let parent = relative_path
+            .parent()
+            .ok_or_else(|| "write target must have a parent directory".to_owned())?;
+
+        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
+            "write revalidation requires an anchored workspace capability".to_owned()
+        })?;
+
+        if !parent.as_os_str().is_empty() {
+            workspace
+                .open_dir_nofollow(parent)
+                .map_err(|error| format!("failed to revalidate write target parent: {error}"))?;
+        }
+
+        match workspace.symlink_metadata(relative_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err("write target must not be a symbolic link".to_owned());
+                }
+
+                if !metadata.is_file() {
+                    return Err("write target must be a regular file".to_owned());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to revalidate existing write target: {error}"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn write_text_file(&self, requested_path: &str, content: &str) -> Result<(), String> {
         if content.len() > MAX_WRITE_BYTES {
             return Err(format!(
@@ -780,6 +834,153 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(content, "original");
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn anchored_revalidation_accepts_new_file_with_valid_parent() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-revalidation-valid-new-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let config_dir = workspace.join("config");
+
+        fs::create_dir_all(&config_dir)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.revalidate_write_target("config/settings.txt");
+
+        assert_eq!(result, Ok(()));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn anchored_revalidation_accepts_existing_regular_file() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-revalidation-existing-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let existing_file = workspace.join("settings.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&existing_file, "original")
+            .map_err(|error| format!("failed to create existing test file: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.revalidate_write_target("settings.txt");
+
+        assert_eq!(result, Ok(()));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn anchored_revalidation_accepts_new_file_at_workspace_root() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-revalidation-root-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.revalidate_write_target("new.txt");
+
+        assert_eq!(result, Ok(()));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn anchored_revalidation_rejects_final_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-revalidation-final-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let real_file = workspace.join("real.txt");
+        let linked_file = workspace.join("linked.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&real_file, "original")
+            .map_err(|error| format!("failed to create test file: {error}"))?;
+
+        symlink(&real_file, &linked_file)
+            .map_err(|error| format!("failed to create final symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.revalidate_write_target("linked.txt");
+
+        assert!(result.is_err(), "unexpected result: {result:?}");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_revalidation_rejects_internal_parent_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-revalidation-parent-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let real_dir = workspace.join("real");
+
+        fs::create_dir_all(&real_dir)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        symlink(&real_dir, workspace.join("linked"))
+            .map_err(|error| format!("failed to create parent symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.revalidate_write_target("linked/new.txt");
+
+        assert!(result.is_err());
+
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
 
