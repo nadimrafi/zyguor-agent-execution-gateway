@@ -17,7 +17,7 @@ use sandbox::{SandboxConfig, SandboxExecutor};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 #[cfg(test)]
@@ -111,6 +111,24 @@ enum AdminOutcome {
         execution_outcome: ExecutionOutcome,
         error: String,
     },
+}
+fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
+    match outcome {
+        AdminOutcome::Approved { request_id } => {
+            format!("OK APPROVED {request_id}\n")
+        }
+        AdminOutcome::Rejected { pending } => {
+            format!("OK REJECTED {}\n", pending.request_id)
+        }
+        AdminOutcome::WriteFailed { request_id, error } => {
+            format!("ERROR WRITE_FAILED {request_id} {error}\n")
+        }
+        AdminOutcome::CompletionAuditFailed {
+            request_id, error, ..
+        } => {
+            format!("ERROR COMPLETION_AUDIT_FAILED {request_id} {error}\n")
+        }
+    }
 }
 
 fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
@@ -654,12 +672,51 @@ async fn handle_admin_connection(
     }
 
     if input.len() > MAX_ADMIN_COMMAND_LENGTH {
-        return Err("admin command exceeds maximum length".to_owned());
+        let error = "admin command exceeds maximum length".to_owned();
+        let response = format!("ERROR {error}\n");
+
+        reader
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|write_error| {
+                format!("{error}; failed to write admin error response: {write_error}")
+            })?;
+
+        return Err(error);
     }
 
-    let command = parse_admin_command(&input)?;
+    let result = match parse_admin_command(&input) {
+        Ok(command) => handle_admin_command(command, pending_reviews, filesystem),
+        Err(error) => Err(error),
+    };
 
-    handle_admin_command(command, pending_reviews, filesystem)
+    match result {
+        Ok(outcome) => {
+            let response = format_admin_outcome_response(&outcome);
+
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .map_err(|error| format!("failed to write admin response: {error}"))?;
+
+            Ok(outcome)
+        }
+        Err(error) => {
+            let response = format!("ERROR {error}\n");
+
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .map_err(|write_error| {
+                    format!("{error}; failed to write admin error response: {write_error}")
+                })?;
+
+            Err(error)
+        }
+    }
 }
 async fn run_admin_listener(
     listener: UnixListener,
@@ -775,7 +832,7 @@ mod gateway_tests {
     }
     #[tokio::test]
     async fn admin_connection_rejects_pending_request() -> Result<(), String> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
         let socket_path =
@@ -812,7 +869,16 @@ mod gateway_tests {
             stream
                 .write_all(command.as_bytes())
                 .await
-                .map_err(|error| format!("failed to write admin command: {error}"))
+                .map_err(|error| format!("failed to write admin command: {error}"))?;
+
+            let mut response = String::new();
+
+            stream
+                .read_to_string(&mut response)
+                .await
+                .map_err(|error| format!("failed to read admin response: {error}"))?;
+
+            Ok::<String, String>(response)
         });
 
         let (stream, _) = listener
@@ -823,9 +889,11 @@ mod gateway_tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let rejected = handle_admin_connection(stream, &pending_reviews, &filesystem).await?;
 
-        client
+        let response = client
             .await
             .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert_eq!(response, format!("OK REJECTED {request_id}\n"));
 
         let AdminOutcome::Rejected { pending } = rejected else {
             return Err("expected rejected admin outcome".to_owned());
@@ -845,6 +913,133 @@ mod gateway_tests {
 
         std::fs::remove_file(&socket_path)
             .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn admin_outcome_formatter_reports_execution_and_audit_failures() {
+        let request_id = uuid::Uuid::new_v4();
+
+        let write_failed = AdminOutcome::WriteFailed {
+            request_id,
+            error: "simulated write failure".to_owned(),
+        };
+
+        assert_eq!(
+            super::format_admin_outcome_response(&write_failed),
+            format!("ERROR WRITE_FAILED {request_id} simulated write failure\n")
+        );
+
+        let completion_audit_failed = AdminOutcome::CompletionAuditFailed {
+            request_id,
+            execution_outcome: ExecutionOutcome::Success,
+            error: "simulated completion audit failure".to_owned(),
+        };
+
+        assert_eq!(
+            super::format_admin_outcome_response(&completion_audit_failed),
+            format!(
+                "ERROR COMPLETION_AUDIT_FAILED {request_id} simulated completion audit failure\n"
+            )
+        );
+    }
+    #[tokio::test]
+    async fn admin_connection_approves_pending_request_and_returns_response() -> Result<(), String>
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let request_id = uuid::Uuid::new_v4();
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-admin-approval-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let listener = create_admin_listener(&socket_path).await?;
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "approved.txt".to_owned(),
+                    content: "approved content".to_owned(),
+                }),
+                "Test admin approval response".to_owned(),
+            ))?;
+        }
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))?;
+
+            let command = format!("APPROVE {request_id}\n");
+
+            stream
+                .write_all(command.as_bytes())
+                .await
+                .map_err(|error| format!("failed to write admin command: {error}"))?;
+
+            let mut response = String::new();
+
+            stream
+                .read_to_string(&mut response)
+                .await
+                .map_err(|error| format!("failed to read admin response: {error}"))?;
+
+            Ok::<String, String>(response)
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let outcome = handle_admin_connection(stream, &pending_reviews, &filesystem).await?;
+
+        let response = client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert_eq!(response, format!("OK APPROVED {request_id}\n"));
+        assert_eq!(outcome, AdminOutcome::Approved { request_id });
+
+        let written_content = std::fs::read_to_string(workspace.join("approved.txt"))
+            .map_err(|error| format!("failed to read approved test file: {error}"))?;
+
+        assert_eq!(written_content, "approved content");
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert!(store.get(&request_id).is_none());
+        }
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
 
         Ok(())
     }
@@ -912,9 +1107,8 @@ mod gateway_tests {
     #[tokio::test]
     async fn admin_connection_rejects_oversized_command_without_consuming_request()
     -> Result<(), String> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
-
         let socket_path =
             std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
 
@@ -952,7 +1146,16 @@ mod gateway_tests {
             stream
                 .write_all(oversized.as_bytes())
                 .await
-                .map_err(|error| format!("failed to write admin command: {error}"))
+                .map_err(|error| format!("failed to write admin command: {error}"))?;
+
+            let mut response = String::new();
+
+            stream
+                .read_to_string(&mut response)
+                .await
+                .map_err(|error| format!("failed to read admin response: {error}"))?;
+
+            Ok::<String, String>(response)
         });
 
         let (stream, _) = listener
@@ -963,7 +1166,7 @@ mod gateway_tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
 
-        client
+        let response = client
             .await
             .map_err(|error| format!("admin client task failed: {error}"))??;
 
@@ -971,6 +1174,7 @@ mod gateway_tests {
             result,
             Err("admin command exceeds maximum length".to_owned())
         );
+        assert_eq!(response, "ERROR admin command exceeds maximum length\n");
 
         {
             let store = pending_reviews
@@ -979,6 +1183,122 @@ mod gateway_tests {
 
             assert!(store.get(&request_id).is_some());
         }
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_connection_returns_error_for_invalid_command() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+        let pending_reviews = empty_pending_review_store();
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))?;
+
+            stream
+                .write_all(b"INVALID COMMAND\n")
+                .await
+                .map_err(|error| format!("failed to write admin command: {error}"))?;
+
+            let mut response = String::new();
+
+            stream
+                .read_to_string(&mut response)
+                .await
+                .map_err(|error| format!("failed to read admin response: {error}"))?;
+
+            Ok::<String, String>(response)
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
+
+        let response = client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert!(result.is_err());
+        assert!(response.starts_with("ERROR "));
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_connection_returns_error_for_unknown_request() -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+        let pending_reviews = empty_pending_review_store();
+        let request_id = uuid::Uuid::new_v4();
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))?;
+
+            let command = format!("APPROVE {request_id}\n");
+
+            stream
+                .write_all(command.as_bytes())
+                .await
+                .map_err(|error| format!("failed to write admin command: {error}"))?;
+
+            let mut response = String::new();
+
+            stream
+                .read_to_string(&mut response)
+                .await
+                .map_err(|error| format!("failed to read admin response: {error}"))?;
+
+            Ok::<String, String>(response)
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
+
+        let response = client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        assert_eq!(result, Err("pending review request not found".to_owned()));
+
+        assert_eq!(response, "ERROR pending review request not found\n");
 
         drop(listener);
 
