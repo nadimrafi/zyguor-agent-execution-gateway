@@ -26,14 +26,17 @@ pub enum PolicyOperation {
     Add,
     ReadFile,
     WriteFile,
+    GitStatus,
 }
 
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
     match operation {
-        PolicyOperation::Add | PolicyOperation::ReadFile => PolicyEvaluation {
-            decision: PolicyDecision::Allow,
-            reason: PolicyReason::Safe,
-        },
+        PolicyOperation::Add | PolicyOperation::ReadFile | PolicyOperation::GitStatus => {
+            PolicyEvaluation {
+                decision: PolicyDecision::Allow,
+                reason: PolicyReason::Safe,
+            }
+        }
         PolicyOperation::WriteFile => PolicyEvaluation {
             decision: PolicyDecision::Review,
             reason: PolicyReason::Write,
@@ -104,6 +107,13 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Review);
         assert_eq!(evaluation.reason, PolicyReason::Write);
+    }
+    #[test]
+    fn allows_git_status_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::GitStatus);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
     }
 
     #[test]

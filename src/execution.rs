@@ -19,4 +19,5 @@ pub enum ExecutionRequest {
     Add(AddArguments),
     ReadFile(ReadFileArguments),
     WriteFile(WriteFileArguments),
+    GitStatus,
 }

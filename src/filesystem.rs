@@ -54,6 +54,9 @@ impl FileSystemCapability {
 
         Ok(self.workspace_root.join(path))
     }
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
 
     pub fn resolve_existing_path(&self, requested_path: &str) -> Result<PathBuf, String> {
         let candidate = self.validate_relative_path(requested_path)?;

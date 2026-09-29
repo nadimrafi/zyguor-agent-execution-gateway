@@ -1,6 +1,7 @@
 mod audit;
 mod execution;
 mod filesystem;
+mod git;
 mod pending_review;
 mod policy;
 mod sandbox;
@@ -8,6 +9,7 @@ mod sandbox;
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArguments};
 use filesystem::FileSystemCapability;
+use git::read_git_status;
 use pending_review::{PendingReview, PendingReviewStore};
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, PolicyReason, block_out_of_scope,
@@ -304,6 +306,7 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
                 content: content.clone(),
             }))
         }
+        "git_status" => Ok(ExecutionRequest::GitStatus),
         other => Err(format!("unsupported operation: {other}")),
     }
 }
@@ -330,6 +333,7 @@ fn evaluate_request(
                 evaluate_operation(PolicyOperation::WriteFile)
             }
         }
+        ExecutionRequest::GitStatus => evaluate_operation(PolicyOperation::GitStatus),
     }
 }
 
@@ -618,6 +622,14 @@ fn execute_request(
             ExecutionRequest::ReadFile(arguments) => filesystem
                 .read_text_file(&arguments.path)
                 .map(|content| ExecutionResult::Text { content }),
+
+            ExecutionRequest::GitStatus => {
+                let status = read_git_status(filesystem.workspace_root())?;
+
+                serde_json::to_string(&status)
+                    .map(|content| ExecutionResult::Text { content })
+                    .map_err(|error| format!("failed to serialize Git status result: {error}"))
+            }
 
             ExecutionRequest::WriteFile(_) => {
                 Err("write_file execution requires approval and is not enabled".to_owned())
@@ -1482,7 +1494,9 @@ mod gateway_tests {
             ExecutionRequest::Add(_) => {
                 // keep existing assertions
             }
-            ExecutionRequest::ReadFile(_) | ExecutionRequest::WriteFile(_) => {
+            ExecutionRequest::ReadFile(_)
+            | ExecutionRequest::WriteFile(_)
+            | ExecutionRequest::GitStatus => {
                 panic!("expected Add execution request");
             }
         }
@@ -1616,7 +1630,9 @@ mod gateway_tests {
             ExecutionRequest::ReadFile(arguments) => {
                 assert_eq!(arguments.path, "README.md");
             }
-            ExecutionRequest::Add(_) | ExecutionRequest::WriteFile(_) => {
+            ExecutionRequest::Add(_)
+            | ExecutionRequest::WriteFile(_)
+            | ExecutionRequest::GitStatus => {
                 panic!("expected ReadFile execution request");
             }
         }
@@ -1667,6 +1683,27 @@ mod gateway_tests {
             "read_file path cannot be empty"
         );
     }
+    #[test]
+    fn builds_git_status_execution_request() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "git_status".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "inspect repository status".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(request, ExecutionRequest::GitStatus);
+
+        Ok(())
+    }
 
     #[test]
     fn builds_write_file_execution_request() {
@@ -1690,7 +1727,9 @@ mod gateway_tests {
                 assert_eq!(arguments.path, "notes.txt");
                 assert_eq!(arguments.content, "Hello from Zyguor");
             }
-            ExecutionRequest::Add(_) | ExecutionRequest::ReadFile(_) => {
+            ExecutionRequest::Add(_)
+            | ExecutionRequest::ReadFile(_)
+            | ExecutionRequest::GitStatus => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -1787,7 +1826,9 @@ mod gateway_tests {
                 assert_eq!(arguments.path, "empty.txt");
                 assert!(arguments.content.is_empty());
             }
-            ExecutionRequest::Add(_) | ExecutionRequest::ReadFile(_) => {
+            ExecutionRequest::Add(_)
+            | ExecutionRequest::ReadFile(_)
+            | ExecutionRequest::GitStatus => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -1956,7 +1997,9 @@ mod gateway_tests {
                 assert_eq!(arguments.left, 3);
                 assert_eq!(arguments.right, 6);
             }
-            ExecutionRequest::ReadFile(_) | ExecutionRequest::WriteFile(_) => {
+            ExecutionRequest::ReadFile(_)
+            | ExecutionRequest::WriteFile(_)
+            | ExecutionRequest::GitStatus => {
                 panic!("expected Add execution request");
             }
         }
@@ -2332,6 +2375,75 @@ mod gateway_tests {
         assert_eq!(json["execution_outcome"], "Success");
         assert_eq!(json["result"]["type"], "text");
         assert_eq!(json["result"]["content"], "Hello from Zyguor");
+
+        std::fs::remove_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn git_status_executes_inside_workspace() -> Result<(), String> {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "zyguor-git-status-integration-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        git2::Repository::init(&workspace_root)
+            .map_err(|error| format!("failed to initialize test repository: {error}"))?;
+
+        std::fs::write(workspace_root.join("notes.txt"), "Hello from Zyguor")
+            .map_err(|error| format!("failed to write test file: {error}"))?;
+
+        let filesystem = FileSystemCapability::new(workspace_root.clone());
+
+        let params = ExecuteParams {
+            operation: "git_status".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "inspect approved workspace repository".to_owned(),
+            },
+        };
+
+        let pending_reviews = empty_pending_review_store();
+        let result = execute_request(&params, &filesystem, &pending_reviews)?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["execution_outcome"], "Success");
+        assert_eq!(json["result"]["type"], "text");
+
+        let content = json["result"]["content"]
+            .as_str()
+            .ok_or_else(|| "expected Git status text result".to_owned())?;
+
+        let git_status: serde_json::Value = serde_json::from_str(content)
+            .map_err(|error| format!("failed to parse Git status result: {error}"))?;
+
+        let entries = git_status["entries"]
+            .as_array()
+            .ok_or_else(|| "expected Git status entries array".to_owned())?;
+
+        let notes_entry = entries
+            .iter()
+            .find(|entry| entry["path"] == "notes.txt")
+            .ok_or_else(|| "expected notes.txt in Git status".to_owned())?;
+
+        assert_eq!(notes_entry["worktree"][0], "new");
 
         std::fs::remove_dir_all(&workspace_root)
             .map_err(|error| format!("failed to remove test workspace: {error}"))?;
