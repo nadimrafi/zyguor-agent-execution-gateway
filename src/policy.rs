@@ -11,6 +11,7 @@ pub enum PolicyDecision {
 pub enum PolicyReason {
     Safe,
     Write,
+    CodeExecution,
     Destructive,
     OutOfScope,
 }
@@ -27,6 +28,7 @@ pub enum PolicyOperation {
     ReadFile,
     WriteFile,
     GitStatus,
+    RunCargoTest,
 }
 
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
@@ -37,13 +39,18 @@ pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
                 reason: PolicyReason::Safe,
             }
         }
+
         PolicyOperation::WriteFile => PolicyEvaluation {
             decision: PolicyDecision::Review,
             reason: PolicyReason::Write,
         },
+
+        PolicyOperation::RunCargoTest => PolicyEvaluation {
+            decision: PolicyDecision::Review,
+            reason: PolicyReason::CodeExecution,
+        },
     }
 }
-
 pub fn block_out_of_scope() -> PolicyEvaluation {
     PolicyEvaluation {
         decision: PolicyDecision::Block,
@@ -114,6 +121,13 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+    #[test]
+    fn reviews_run_cargo_test_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::RunCargoTest);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Review);
+        assert_eq!(evaluation.reason, PolicyReason::CodeExecution);
     }
 
     #[test]

@@ -2419,6 +2419,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "git2",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",

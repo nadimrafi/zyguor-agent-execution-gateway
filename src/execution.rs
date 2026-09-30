@@ -20,4 +20,5 @@ pub enum ExecutionRequest {
     ReadFile(ReadFileArguments),
     WriteFile(WriteFileArguments),
     GitStatus,
+    RunCargoTest,
 }

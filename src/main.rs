@@ -1,4 +1,5 @@
 mod audit;
+mod cargo_test;
 mod execution;
 mod filesystem;
 mod git;
@@ -7,6 +8,7 @@ mod policy;
 mod sandbox;
 
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
+use cargo_test::{CargoTestExecutor, CargoTestResult};
 use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArguments};
 use filesystem::FileSystemCapability;
 use git::read_git_status;
@@ -64,17 +66,35 @@ struct ExecutionContextParams {
 enum ExecutionResult {
     Integer { value: i32 },
     Text { content: String },
+    CargoTest { result: CargoTestResult },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ApprovedWriteOutcome {
+enum ReviewedOperationResult {
+    Success(Option<ExecutionResult>),
+
+    FailedWithResult {
+        error: String,
+        result: ExecutionResult,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewedExecutionOutcome {
     Success,
-    WriteFailed(String),
+    SuccessWithResult(ExecutionResult),
+
+    ExecutionFailed(String),
+
+    ExecutionFailedWithResult {
+        error: String,
+        result: ExecutionResult,
+    },
+
     CompletionAuditFailed {
         execution_outcome: ExecutionOutcome,
         error: String,
+        result: Option<ExecutionResult>,
     },
 }
-
 #[derive(Debug, serde::Serialize)]
 struct GatewayResponse<'a> {
     request_id: uuid::Uuid,
@@ -108,9 +128,22 @@ enum AdminOutcome {
         request_id: uuid::Uuid,
         error: String,
     },
+    CargoTestCompleted {
+        request_id: uuid::Uuid,
+        result: CargoTestResult,
+    },
+    CargoTestFailed {
+        request_id: uuid::Uuid,
+        result: CargoTestResult,
+    },
     CompletionAuditFailed {
         request_id: uuid::Uuid,
         execution_outcome: ExecutionOutcome,
+        error: String,
+        result: Option<ExecutionResult>,
+    },
+    CargoTestExecutionFailed {
+        request_id: uuid::Uuid,
         error: String,
     },
 }
@@ -124,6 +157,26 @@ fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
         }
         AdminOutcome::WriteFailed { request_id, error } => {
             format!("ERROR WRITE_FAILED {request_id} {error}\n")
+        }
+        AdminOutcome::CargoTestExecutionFailed { request_id, error } => {
+            format!("ERROR CARGO_TEST_EXECUTION_FAILED {request_id} {error}\n")
+        }
+        AdminOutcome::CargoTestCompleted { request_id, result } => {
+            match serde_json::to_string(result) {
+                Ok(json) => format!("OK CARGO_TEST_COMPLETED {request_id} {json}\n"),
+                Err(error) => {
+                    format!("ERROR RESPONSE_SERIALIZATION_FAILED {request_id} {error}\n")
+                }
+            }
+        }
+
+        AdminOutcome::CargoTestFailed { request_id, result } => {
+            match serde_json::to_string(result) {
+                Ok(json) => format!("ERROR CARGO_TEST_FAILED {request_id} {json}\n"),
+                Err(error) => {
+                    format!("ERROR RESPONSE_SERIALIZATION_FAILED {request_id} {error}\n")
+                }
+            }
         }
         AdminOutcome::CompletionAuditFailed {
             request_id, error, ..
@@ -307,6 +360,7 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
             }))
         }
         "git_status" => Ok(ExecutionRequest::GitStatus),
+        "run_cargo_test" => Ok(ExecutionRequest::RunCargoTest),
         other => Err(format!("unsupported operation: {other}")),
     }
 }
@@ -318,6 +372,7 @@ fn evaluate_request(
     match request {
         ExecutionRequest::Add(_) => evaluate_operation(PolicyOperation::Add),
 
+        ExecutionRequest::RunCargoTest => evaluate_operation(PolicyOperation::RunCargoTest),
         ExecutionRequest::ReadFile(arguments) => {
             if filesystem.resolve_existing_path(&arguments.path).is_err() {
                 block_out_of_scope()
@@ -372,6 +427,13 @@ fn restore_claimed_request(
 
     store.restore_claimed(pending)
 }
+fn review_reason_for_request(request: &ExecutionRequest) -> Result<PolicyReason, String> {
+    match request {
+        ExecutionRequest::WriteFile(_) => Ok(PolicyReason::Write),
+        ExecutionRequest::RunCargoTest => Ok(PolicyReason::CodeExecution),
+        _ => Err("request is not eligible for human review".to_owned()),
+    }
+}
 fn revalidate_pending_request(
     pending: &PendingReview,
     filesystem: &FileSystemCapability,
@@ -381,6 +443,11 @@ fn revalidate_pending_request(
             .revalidate_write_target(&arguments.path)
             .map_err(|error| format!("pending write target is no longer valid: {error}")),
 
+        ExecutionRequest::RunCargoTest => filesystem
+            .resolve_existing_path("Cargo.toml")
+            .map(|_| ())
+            .map_err(|error| format!("pending Cargo test workspace is no longer valid: {error}")),
+
         _ => Err("pending request is not eligible for approval".to_owned()),
     }
 }
@@ -388,11 +455,13 @@ fn write_approval_audit<F>(pending: &PendingReview, mut audit_writer: F) -> Resu
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
 {
+    let reason = review_reason_for_request(&pending.request)?;
+
     let record = AuditRecord::new(
         pending.request_id,
         &pending.purpose,
         PolicyDecision::Review,
-        PolicyReason::Write,
+        reason,
         AuditPhase::Approval,
         ExecutionOutcome::NotExecuted,
     )
@@ -400,6 +469,7 @@ where
 
     audit_writer(&record).map_err(|error| format!("failed to persist approval audit: {error}"))
 }
+
 fn write_rejection_audit<F>(pending: &PendingReview, mut audit_writer: F) -> Result<(), String>
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
@@ -408,7 +478,7 @@ where
         pending.request_id,
         &pending.purpose,
         PolicyDecision::Review,
-        PolicyReason::Write,
+        review_reason_for_request(&pending.request)?,
         AuditPhase::Rejection,
         ExecutionOutcome::NotExecuted,
     )
@@ -453,20 +523,51 @@ where
 
     Ok(())
 }
-fn execute_approved_write<F, W>(
+fn execute_cargo_test(
+    filesystem: &FileSystemCapability,
+) -> Result<ReviewedOperationResult, String> {
+    let executor = CargoTestExecutor::new(Default::default());
+
+    let result = executor.run(filesystem.workspace_root())?;
+
+    let execution_result = ExecutionResult::CargoTest {
+        result: result.clone(),
+    };
+
+    if result.success {
+        Ok(ReviewedOperationResult::Success(Some(execution_result)))
+    } else {
+        let error = if result.timed_out {
+            "cargo test timed out".to_owned()
+        } else {
+            match result.exit_code {
+                Some(code) => format!("cargo test exited with status {code}"),
+                None => "cargo test failed without an exit status".to_owned(),
+            }
+        };
+
+        Ok(ReviewedOperationResult::FailedWithResult {
+            error,
+            result: execution_result,
+        })
+    }
+}
+fn execute_reviewed_action<F, W>(
     pending: &PendingReview,
     mut audit_writer: F,
-    write_operation: W,
-) -> Result<ApprovedWriteOutcome, String>
+    operation: W,
+) -> Result<ReviewedExecutionOutcome, String>
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
-    W: FnOnce() -> Result<(), String>,
+    W: FnOnce() -> Result<ReviewedOperationResult, String>,
 {
+    let reason = review_reason_for_request(&pending.request)?;
+
     let pre_execution_record = AuditRecord::new(
         pending.request_id,
         &pending.purpose,
         PolicyDecision::Review,
-        PolicyReason::Write,
+        reason,
         AuditPhase::PreExecution,
         ExecutionOutcome::NotExecuted,
     )
@@ -475,40 +576,94 @@ where
     audit_writer(&pre_execution_record)
         .map_err(|error| format!("failed to persist pre-execution audit: {error}"))?;
 
-    let write_result = write_operation();
+    let execution_result = operation();
 
-    let execution_outcome = match &write_result {
-        Ok(()) => ExecutionOutcome::Success,
-        Err(_) => ExecutionOutcome::Failed,
+    let execution_outcome = match &execution_result {
+        Ok(ReviewedOperationResult::Success(_)) => ExecutionOutcome::Success,
+
+        Ok(ReviewedOperationResult::FailedWithResult { .. }) | Err(_) => ExecutionOutcome::Failed,
+    };
+    let preserved_result = match &execution_result {
+        Ok(ReviewedOperationResult::Success(Some(result))) => Some(result.clone()),
+
+        Ok(ReviewedOperationResult::FailedWithResult { result, .. }) => Some(result.clone()),
+
+        Ok(ReviewedOperationResult::Success(None)) | Err(_) => None,
     };
 
     let completion_record = match AuditRecord::new(
         pending.request_id,
         &pending.purpose,
         PolicyDecision::Review,
-        PolicyReason::Write,
+        reason,
         AuditPhase::Completion,
         execution_outcome,
     ) {
         Ok(record) => record,
         Err(error) => {
-            return Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+            return Ok(ReviewedExecutionOutcome::CompletionAuditFailed {
                 execution_outcome,
                 error: format!("failed to create completion audit record: {error}"),
+                result: preserved_result.clone(),
             });
         }
     };
 
     if let Err(error) = audit_writer(&completion_record) {
-        return Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+        return Ok(ReviewedExecutionOutcome::CompletionAuditFailed {
             execution_outcome,
             error,
+            result: preserved_result,
         });
     }
 
-    match write_result {
-        Ok(()) => Ok(ApprovedWriteOutcome::Success),
-        Err(error) => Ok(ApprovedWriteOutcome::WriteFailed(error)),
+    match execution_result {
+        Ok(ReviewedOperationResult::Success(Some(result))) => {
+            Ok(ReviewedExecutionOutcome::SuccessWithResult(result))
+        }
+
+        Ok(ReviewedOperationResult::Success(None)) => Ok(ReviewedExecutionOutcome::Success),
+
+        Ok(ReviewedOperationResult::FailedWithResult { error, result }) => {
+            Ok(ReviewedExecutionOutcome::ExecutionFailedWithResult { error, result })
+        }
+
+        Err(error) => Ok(ReviewedExecutionOutcome::ExecutionFailed(error)),
+    }
+}
+fn execute_approved_write<F, W>(
+    pending: &PendingReview,
+    audit_writer: F,
+    write_operation: W,
+) -> Result<ReviewedExecutionOutcome, String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+    W: FnOnce() -> Result<(), String>,
+{
+    execute_reviewed_action(pending, audit_writer, || {
+        write_operation().map(|()| ReviewedOperationResult::Success(None))
+    })
+}
+fn execute_claimed_reviewed_action<F, W>(
+    claimed: &PendingReview,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    audit_writer: F,
+    operation: W,
+) -> Result<ReviewedExecutionOutcome, String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+    W: FnOnce() -> Result<ReviewedOperationResult, String>,
+{
+    match execute_reviewed_action(claimed, audit_writer, operation) {
+        Ok(outcome) => Ok(outcome),
+
+        Err(execution_error) => {
+            restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
+                format!("{execution_error}; failed to restore claimed request: {restore_error}")
+            })?;
+
+            Err(execution_error)
+        }
     }
 }
 fn execute_claimed_write<F, W>(
@@ -516,7 +671,7 @@ fn execute_claimed_write<F, W>(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     audit_writer: F,
     write_operation: W,
-) -> Result<ApprovedWriteOutcome, String>
+) -> Result<ReviewedExecutionOutcome, String>
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
     W: FnOnce() -> Result<(), String>,
@@ -560,20 +715,75 @@ fn handle_admin_command(
                             filesystem.write_text_file(&arguments.path, &arguments.content)
                         })?;
                     match outcome {
-                        ApprovedWriteOutcome::Success => Ok(AdminOutcome::Approved { request_id }),
-                        ApprovedWriteOutcome::WriteFailed(error) => {
+                        ReviewedExecutionOutcome::Success => {
+                            Ok(AdminOutcome::Approved { request_id })
+                        }
+                        ReviewedExecutionOutcome::SuccessWithResult(_) => {
+                            Err("write approval returned an unexpected execution result".to_owned())
+                        }
+                        ReviewedExecutionOutcome::ExecutionFailed(error) => {
                             Ok(AdminOutcome::WriteFailed { request_id, error })
                         }
-                        ApprovedWriteOutcome::CompletionAuditFailed {
+                        ReviewedExecutionOutcome::ExecutionFailedWithResult { .. } => {
+                            Err("write approval returned an unexpected execution result".to_owned())
+                        }
+                        ReviewedExecutionOutcome::CompletionAuditFailed {
                             execution_outcome,
                             error,
+                            ..
                         } => Ok(AdminOutcome::CompletionAuditFailed {
                             request_id,
                             execution_outcome,
                             error,
+                            result: None,
                         }),
                     }
                 }
+                ExecutionRequest::RunCargoTest => {
+                    let outcome = execute_claimed_reviewed_action(
+                        &claimed,
+                        pending_reviews,
+                        persist_audit,
+                        || execute_cargo_test(filesystem),
+                    )?;
+
+                    match outcome {
+                        ReviewedExecutionOutcome::SuccessWithResult(
+                            ExecutionResult::CargoTest { result },
+                        ) => Ok(AdminOutcome::CargoTestCompleted { request_id, result }),
+
+                        ReviewedExecutionOutcome::ExecutionFailedWithResult {
+                            result: ExecutionResult::CargoTest { result },
+                            ..
+                        } => Ok(AdminOutcome::CargoTestFailed { request_id, result }),
+
+                        ReviewedExecutionOutcome::ExecutionFailed(error) => {
+                            Ok(AdminOutcome::CargoTestExecutionFailed { request_id, error })
+                        }
+
+                        ReviewedExecutionOutcome::CompletionAuditFailed {
+                            execution_outcome,
+                            error,
+                            result,
+                        } => Ok(AdminOutcome::CompletionAuditFailed {
+                            request_id,
+                            execution_outcome,
+                            error,
+                            result,
+                        }),
+
+                        ReviewedExecutionOutcome::Success => {
+                            Err("cargo test approval returned no execution result".to_owned())
+                        }
+
+                        ReviewedExecutionOutcome::SuccessWithResult(_)
+                        | ReviewedExecutionOutcome::ExecutionFailedWithResult { .. } => Err(
+                            "cargo test approval returned an unexpected execution result"
+                                .to_owned(),
+                        ),
+                    }
+                }
+
                 _ => Err("claimed request is not eligible for approval".to_owned()),
             }
         }
@@ -633,6 +843,9 @@ fn execute_request(
 
             ExecutionRequest::WriteFile(_) => {
                 Err("write_file execution requires approval and is not enabled".to_owned())
+            }
+            ExecutionRequest::RunCargoTest => {
+                Err("run_cargo_test execution requires approval and is not enabled".to_owned())
             }
         },
     )
@@ -784,11 +997,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod gateway_tests {
     use super::ExecutionResult;
     use super::{
-        AddArguments, AdminCommand, AdminOutcome, ApprovedWriteOutcome, AuditPhase, ExecuteParams,
+        AddArguments, AdminCommand, AdminOutcome, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
         FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision,
-        PolicyEvaluation, ReadFileArguments, WriteFileArguments, audit_claimed_approval,
-        build_execution_request, create_admin_listener, evaluate_request,
+        PolicyEvaluation, ReadFileArguments, ReviewedExecutionOutcome, WriteFileArguments,
+        audit_claimed_approval, build_execution_request, create_admin_listener, evaluate_request,
         execute_message_with_audit_id, execute_request, handle_admin_command,
         handle_admin_connection, parse_admin_command, reject_pending_request,
         run_infinite_loop_with_fuel,
@@ -946,6 +1159,7 @@ mod gateway_tests {
             request_id,
             execution_outcome: ExecutionOutcome::Success,
             error: "simulated completion audit failure".to_owned(),
+            result: None,
         };
 
         assert_eq!(
@@ -1355,6 +1569,185 @@ mod gateway_tests {
         );
     }
     #[test]
+    fn builds_run_cargo_test_execution_request() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "run_cargo_test".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "run approved Rust tests".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(request, ExecutionRequest::RunCargoTest);
+
+        Ok(())
+    }
+    #[test]
+    fn approved_cargo_test_preserves_failed_test_result() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-cargo-failure-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        let src_directory = workspace.join("src");
+
+        std::fs::create_dir_all(&src_directory)
+            .map_err(|error| format!("failed to create Cargo test workspace: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            r#"[package]
+name = "zyguor-cargo-failure-fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.toml: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.lock"),
+            r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "zyguor-cargo-failure-fixture"
+version = "0.1.0"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.lock: {error}"))?;
+
+        std::fs::write(
+            src_directory.join("lib.rs"),
+            r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_fails() {
+        assert_eq!(2 + 2, 5);
+    }
+}
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo test source: {error}"))?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::RunCargoTest,
+                "Test failed Cargo execution".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        )?;
+
+        match result {
+            AdminOutcome::CargoTestFailed {
+                request_id: failed_request_id,
+                result,
+            } => {
+                assert_eq!(failed_request_id, request_id);
+                assert!(!result.success);
+                assert!(!result.timed_out);
+                assert_ne!(result.exit_code, Some(0));
+            }
+
+            other => {
+                return Err(format!("expected failed Cargo test outcome, got {other:?}"));
+            }
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove Cargo test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn cargo_test_approval_revalidation_retains_invalid_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-cargo-revalidation-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create Cargo test workspace: {error}"))?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::RunCargoTest,
+                "Test Cargo approval revalidation".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("Cargo approval should fail revalidation");
+
+        assert!(
+            error.contains("pending Cargo test workspace is no longer valid"),
+            "unexpected error: {error}"
+        );
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+        assert_eq!(store.len(), 1);
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove Cargo test workspace: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
     fn valid_approval_claims_and_consumes_pending_request() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
         let pending_reviews = empty_pending_review_store();
@@ -1496,7 +1889,8 @@ mod gateway_tests {
             }
             ExecutionRequest::ReadFile(_)
             | ExecutionRequest::WriteFile(_)
-            | ExecutionRequest::GitStatus => {
+            | ExecutionRequest::GitStatus
+            | ExecutionRequest::RunCargoTest => {
                 panic!("expected Add execution request");
             }
         }
@@ -1632,7 +2026,8 @@ mod gateway_tests {
             }
             ExecutionRequest::Add(_)
             | ExecutionRequest::WriteFile(_)
-            | ExecutionRequest::GitStatus => {
+            | ExecutionRequest::GitStatus
+            | ExecutionRequest::RunCargoTest => {
                 panic!("expected ReadFile execution request");
             }
         }
@@ -1729,7 +2124,8 @@ mod gateway_tests {
             }
             ExecutionRequest::Add(_)
             | ExecutionRequest::ReadFile(_)
-            | ExecutionRequest::GitStatus => {
+            | ExecutionRequest::GitStatus
+            | ExecutionRequest::RunCargoTest => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -1828,7 +2224,8 @@ mod gateway_tests {
             }
             ExecutionRequest::Add(_)
             | ExecutionRequest::ReadFile(_)
-            | ExecutionRequest::GitStatus => {
+            | ExecutionRequest::GitStatus
+            | ExecutionRequest::RunCargoTest => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -1997,9 +2394,11 @@ mod gateway_tests {
                 assert_eq!(arguments.left, 3);
                 assert_eq!(arguments.right, 6);
             }
+
             ExecutionRequest::ReadFile(_)
             | ExecutionRequest::WriteFile(_)
-            | ExecutionRequest::GitStatus => {
+            | ExecutionRequest::GitStatus
+            | ExecutionRequest::RunCargoTest => {
                 panic!("expected Add execution request");
             }
         }
@@ -2568,7 +2967,7 @@ mod gateway_tests {
 
         assert_eq!(
             result,
-            Ok(ApprovedWriteOutcome::WriteFailed(
+            Ok(ReviewedExecutionOutcome::ExecutionFailed(
                 "simulated write failure".to_owned()
             ))
         );
@@ -2621,9 +3020,10 @@ mod gateway_tests {
 
         assert_eq!(
             result,
-            Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+            Ok(ReviewedExecutionOutcome::CompletionAuditFailed {
                 execution_outcome: ExecutionOutcome::Success,
                 error: "simulated completion audit failure".to_owned(),
+                result: None,
             })
         );
 
@@ -2688,6 +3088,110 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn valid_approval_executes_cargo_test() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-cargo-approval-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        let src_directory = workspace.join("src");
+
+        std::fs::create_dir_all(&src_directory)
+            .map_err(|error| format!("failed to create Cargo test workspace: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            r#"[package]
+name = "zyguor-cargo-test-fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.toml: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.lock"),
+            r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "zyguor-cargo-test-fixture"
+version = "0.1.0"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.lock: {error}"))?;
+
+        std::fs::write(
+            src_directory.join("lib.rs"),
+            r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_passes() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo test source: {error}"))?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::RunCargoTest,
+                "Test approved Cargo execution".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        )?;
+
+        match result {
+            AdminOutcome::CargoTestCompleted {
+                request_id: completed_request_id,
+                result,
+            } => {
+                assert_eq!(completed_request_id, request_id);
+                assert!(result.success);
+                assert!(!result.timed_out);
+                assert_eq!(result.exit_code, Some(0));
+            }
+
+            other => {
+                return Err(format!(
+                    "expected successful Cargo test outcome, got {other:?}"
+                ));
+            }
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+        assert!(store.is_empty());
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove Cargo test workspace: {error}"))?;
+
+        Ok(())
+    }
+
     #[test]
     fn approval_audit_failure_is_propagated() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
@@ -3012,7 +3516,7 @@ mod gateway_tests {
 
         assert_eq!(
             result,
-            Ok(ApprovedWriteOutcome::WriteFailed(
+            Ok(ReviewedExecutionOutcome::ExecutionFailed(
                 "simulated write failure".to_owned()
             ))
         );
@@ -3076,9 +3580,10 @@ mod gateway_tests {
 
         assert_eq!(
             result,
-            Ok(ApprovedWriteOutcome::CompletionAuditFailed {
+            Ok(ReviewedExecutionOutcome::CompletionAuditFailed {
                 execution_outcome: ExecutionOutcome::Success,
                 error: "simulated completion audit failure".to_owned(),
+                result: None,
             })
         );
 
@@ -3119,7 +3624,7 @@ mod gateway_tests {
             },
         );
 
-        assert_eq!(result, Ok(ApprovedWriteOutcome::Success));
+        assert_eq!(result, Ok(ReviewedExecutionOutcome::Success));
         assert_eq!(write_count, 1);
 
         Ok(())
@@ -3148,7 +3653,7 @@ mod gateway_tests {
             || Ok(()),
         );
 
-        assert_eq!(result, Ok(ApprovedWriteOutcome::Success));
+        assert_eq!(result, Ok(ReviewedExecutionOutcome::Success));
 
         assert_eq!(
             records,
