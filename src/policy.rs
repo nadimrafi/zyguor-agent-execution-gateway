@@ -11,6 +11,7 @@ pub enum PolicyDecision {
 pub enum PolicyReason {
     Safe,
     Write,
+    ExternalWrite,
     CodeExecution,
     Destructive,
     OutOfScope,
@@ -29,6 +30,8 @@ pub enum PolicyOperation {
     WriteFile,
     GitStatus,
     RunCargoTest,
+    HttpGet,
+    HttpPost,
 }
 
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
@@ -48,6 +51,15 @@ pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
         PolicyOperation::RunCargoTest => PolicyEvaluation {
             decision: PolicyDecision::Review,
             reason: PolicyReason::CodeExecution,
+        },
+        PolicyOperation::HttpGet => PolicyEvaluation {
+            decision: PolicyDecision::Allow,
+            reason: PolicyReason::Safe,
+        },
+
+        PolicyOperation::HttpPost => PolicyEvaluation {
+            decision: PolicyDecision::Review,
+            reason: PolicyReason::ExternalWrite,
         },
     }
 }
@@ -176,5 +188,20 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+    #[test]
+    fn allows_http_get_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::HttpGet);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+
+    #[test]
+    fn reviews_http_post_operation() {
+        let evaluation = evaluate_operation(PolicyOperation::HttpPost);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Review);
+        assert_eq!(evaluation.reason, PolicyReason::ExternalWrite);
     }
 }

@@ -3,15 +3,22 @@ mod cargo_test;
 mod execution;
 mod filesystem;
 mod git;
+mod http;
+mod http_execution;
 mod pending_review;
 mod policy;
 mod sandbox;
 
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use cargo_test::{CargoTestExecutor, CargoTestResult};
-use execution::{AddArguments, ExecutionRequest, ReadFileArguments, WriteFileArguments};
+use execution::{
+    AddArguments, ExecutionRequest, HttpMethod, HttpRequestArguments, ReadFileArguments,
+    WriteFileArguments,
+};
 use filesystem::FileSystemCapability;
 use git::read_git_status;
+use http::{ValidatedHttpUrl, validate_http_destination};
+use http_execution::{HttpExecutionConfig, HttpExecutionResult, HttpExecutor};
 use pending_review::{PendingReview, PendingReviewStore};
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, PolicyReason, block_out_of_scope,
@@ -48,6 +55,17 @@ struct ExecutionArgumentsParams {
     #[serde(default)]
     #[schemars(with = "String")]
     content: Option<String>,
+    #[serde(default)]
+    #[schemars(with = "String")]
+    method: Option<String>,
+
+    #[serde(default)]
+    #[schemars(with = "String")]
+    url: Option<String>,
+
+    #[serde(default)]
+    #[schemars(with = "String")]
+    body: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -67,7 +85,9 @@ enum ExecutionResult {
     Integer { value: i32 },
     Text { content: String },
     CargoTest { result: CargoTestResult },
+    Http { result: HttpExecutionResult },
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewedOperationResult {
     Success(Option<ExecutionResult>),
@@ -146,6 +166,18 @@ enum AdminOutcome {
         request_id: uuid::Uuid,
         error: String,
     },
+    HttpPostCompleted {
+        request_id: uuid::Uuid,
+        result: HttpExecutionResult,
+    },
+    HttpPostFailed {
+        request_id: uuid::Uuid,
+        result: HttpExecutionResult,
+    },
+    HttpPostExecutionFailed {
+        request_id: uuid::Uuid,
+        error: String,
+    },
 }
 fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
     match outcome {
@@ -173,6 +205,28 @@ fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
         AdminOutcome::CargoTestFailed { request_id, result } => {
             match serde_json::to_string(result) {
                 Ok(json) => format!("ERROR CARGO_TEST_FAILED {request_id} {json}\n"),
+                Err(error) => {
+                    format!("ERROR RESPONSE_SERIALIZATION_FAILED {request_id} {error}\n")
+                }
+            }
+        }
+
+        AdminOutcome::HttpPostExecutionFailed { request_id, error } => {
+            format!("ERROR HTTP_POST_EXECUTION_FAILED {request_id} {error}\n")
+        }
+
+        AdminOutcome::HttpPostCompleted { request_id, result } => {
+            match serde_json::to_string(result) {
+                Ok(json) => format!("OK HTTP_POST_COMPLETED {request_id} {json}\n"),
+                Err(error) => {
+                    format!("ERROR RESPONSE_SERIALIZATION_FAILED {request_id} {error}\n")
+                }
+            }
+        }
+
+        AdminOutcome::HttpPostFailed { request_id, result } => {
+            match serde_json::to_string(result) {
+                Ok(json) => format!("ERROR HTTP_POST_FAILED {request_id} {json}\n"),
                 Err(error) => {
                     format!("ERROR RESPONSE_SERIALIZATION_FAILED {request_id} {error}\n")
                 }
@@ -215,6 +269,7 @@ fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_ADMIN_COMMAND_LENGTH: usize = 256;
+const HTTP_ALLOWED_HOSTS: &[&str] = &["api.example.com"];
 fn validate_message(message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("message cannot be empty".to_owned());
@@ -359,6 +414,43 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
                 content: content.clone(),
             }))
         }
+        "http_request" => {
+            let method = params
+                .arguments
+                .method
+                .as_ref()
+                .ok_or_else(|| "http_request requires arguments.method".to_owned())?;
+
+            let method = match method.trim().to_ascii_lowercase().as_str() {
+                "get" => HttpMethod::Get,
+                "post" => HttpMethod::Post,
+                other => {
+                    return Err(format!(
+                        "unsupported HTTP method: {other}; expected get or post"
+                    ));
+                }
+            };
+
+            let url = params
+                .arguments
+                .url
+                .as_ref()
+                .ok_or_else(|| "http_request requires arguments.url".to_owned())?;
+
+            if url.trim().is_empty() {
+                return Err("http_request URL cannot be empty".to_owned());
+            }
+
+            if method == HttpMethod::Get && params.arguments.body.is_some() {
+                return Err("HTTP GET request must not include a body".to_owned());
+            }
+
+            Ok(ExecutionRequest::HttpRequest(HttpRequestArguments {
+                method,
+                url: url.clone(),
+                body: params.arguments.body.clone(),
+            }))
+        }
         "git_status" => Ok(ExecutionRequest::GitStatus),
         "run_cargo_test" => Ok(ExecutionRequest::RunCargoTest),
         other => Err(format!("unsupported operation: {other}")),
@@ -371,6 +463,16 @@ fn evaluate_request(
 ) -> PolicyEvaluation {
     match request {
         ExecutionRequest::Add(_) => evaluate_operation(PolicyOperation::Add),
+        ExecutionRequest::HttpRequest(arguments) => {
+            if validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS).is_err() {
+                return block_out_of_scope();
+            }
+
+            match arguments.method {
+                HttpMethod::Get => evaluate_operation(PolicyOperation::HttpGet),
+                HttpMethod::Post => evaluate_operation(PolicyOperation::HttpPost),
+            }
+        }
 
         ExecutionRequest::RunCargoTest => evaluate_operation(PolicyOperation::RunCargoTest),
         ExecutionRequest::ReadFile(arguments) => {
@@ -430,7 +532,13 @@ fn restore_claimed_request(
 fn review_reason_for_request(request: &ExecutionRequest) -> Result<PolicyReason, String> {
     match request {
         ExecutionRequest::WriteFile(_) => Ok(PolicyReason::Write),
+
         ExecutionRequest::RunCargoTest => Ok(PolicyReason::CodeExecution),
+
+        ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
+            Ok(PolicyReason::ExternalWrite)
+        }
+
         _ => Err("request is not eligible for human review".to_owned()),
     }
 }
@@ -447,6 +555,13 @@ fn revalidate_pending_request(
             .resolve_existing_path("Cargo.toml")
             .map(|_| ())
             .map_err(|error| format!("pending Cargo test workspace is no longer valid: {error}")),
+        ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
+            validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("pending HTTP POST destination is no longer valid: {error}")
+                })
+        }
 
         _ => Err("pending request is not eligible for approval".to_owned()),
     }
@@ -548,6 +663,30 @@ fn execute_cargo_test(
 
         Ok(ReviewedOperationResult::FailedWithResult {
             error,
+            result: execution_result,
+        })
+    }
+}
+fn execute_http_post(arguments: &HttpRequestArguments) -> Result<ReviewedOperationResult, String> {
+    if arguments.method != HttpMethod::Post {
+        return Err("reviewed HTTP execution requires POST".to_owned());
+    }
+
+    let destination = validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)?;
+
+    let executor = HttpExecutor::new(HttpExecutionConfig::default())?;
+
+    let result = executor.execute(HttpMethod::Post, &destination, arguments.body.as_deref())?;
+
+    let execution_result = ExecutionResult::Http {
+        result: result.clone(),
+    };
+
+    if (200..400).contains(&result.status_code) {
+        Ok(ReviewedOperationResult::Success(Some(execution_result)))
+    } else {
+        Ok(ReviewedOperationResult::FailedWithResult {
+            error: format!("HTTP POST returned status {}", result.status_code),
             result: execution_result,
         })
     }
@@ -687,11 +826,15 @@ where
         }
     }
 }
-fn handle_admin_command(
+fn handle_admin_command_with_http_runner<H>(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
-) -> Result<AdminOutcome, String> {
+    http_post_runner: H,
+) -> Result<AdminOutcome, String>
+where
+    H: FnOnce(&HttpRequestArguments) -> Result<ReviewedOperationResult, String>,
+{
     match command {
         AdminCommand::Approve { request_id } => {
             let pending = inspect_pending_request(request_id, pending_reviews)?;
@@ -739,6 +882,7 @@ fn handle_admin_command(
                         }),
                     }
                 }
+
                 ExecutionRequest::RunCargoTest => {
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
@@ -783,6 +927,52 @@ fn handle_admin_command(
                         ),
                     }
                 }
+                ExecutionRequest::HttpRequest(arguments)
+                    if arguments.method == HttpMethod::Post =>
+                {
+                    let outcome = execute_claimed_reviewed_action(
+                        &claimed,
+                        pending_reviews,
+                        persist_audit,
+                        || http_post_runner(arguments),
+                    )?;
+
+                    match outcome {
+                        ReviewedExecutionOutcome::SuccessWithResult(ExecutionResult::Http {
+                            result,
+                        }) => Ok(AdminOutcome::HttpPostCompleted { request_id, result }),
+
+                        ReviewedExecutionOutcome::ExecutionFailedWithResult {
+                            result: ExecutionResult::Http { result },
+                            ..
+                        } => Ok(AdminOutcome::HttpPostFailed { request_id, result }),
+
+                        ReviewedExecutionOutcome::ExecutionFailed(error) => {
+                            Ok(AdminOutcome::HttpPostExecutionFailed { request_id, error })
+                        }
+
+                        ReviewedExecutionOutcome::CompletionAuditFailed {
+                            execution_outcome,
+                            error,
+                            result,
+                        } => Ok(AdminOutcome::CompletionAuditFailed {
+                            request_id,
+                            execution_outcome,
+                            error,
+                            result,
+                        }),
+
+                        ReviewedExecutionOutcome::Success => {
+                            Err("HTTP POST approval returned no execution result".to_owned())
+                        }
+
+                        ReviewedExecutionOutcome::SuccessWithResult(_)
+                        | ReviewedExecutionOutcome::ExecutionFailedWithResult { .. } => {
+                            Err("HTTP POST approval returned an unexpected execution result"
+                                .to_owned())
+                        }
+                    }
+                }
 
                 _ => Err("claimed request is not eligible for approval".to_owned()),
             }
@@ -796,12 +986,23 @@ fn handle_admin_command(
         }
     }
 }
+fn handle_admin_command(
+    command: AdminCommand,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    filesystem: &FileSystemCapability,
+) -> Result<AdminOutcome, String> {
+    handle_admin_command_with_http_runner(command, pending_reviews, filesystem, execute_http_post)
+}
 
-fn execute_request(
+fn execute_request_with_http_runner<H>(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
-) -> Result<String, String> {
+    http_runner: H,
+) -> Result<String, String>
+where
+    H: FnOnce(HttpMethod, &ValidatedHttpUrl, Option<&str>) -> Result<HttpExecutionResult, String>,
+{
     let request = build_execution_request(params)?;
     let evaluation = evaluate_request(&request, filesystem);
     let request_id = uuid::Uuid::new_v4();
@@ -825,6 +1026,20 @@ fn execute_request(
         evaluation,
         persist_audit,
         || match request {
+            ExecutionRequest::HttpRequest(arguments) => match arguments.method {
+                HttpMethod::Get => {
+                    let destination =
+                        validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)?;
+
+                    http_runner(HttpMethod::Get, &destination, arguments.body.as_deref())
+                        .map(|result| ExecutionResult::Http { result })
+                }
+
+                HttpMethod::Post => {
+                    Err("http POST execution requires approval and is not enabled".to_owned())
+                }
+            },
+
             ExecutionRequest::Add(arguments) => executor
                 .execute_add(arguments)
                 .map(|value| ExecutionResult::Integer { value }),
@@ -844,12 +1059,31 @@ fn execute_request(
             ExecutionRequest::WriteFile(_) => {
                 Err("write_file execution requires approval and is not enabled".to_owned())
             }
+
             ExecutionRequest::RunCargoTest => {
                 Err("run_cargo_test execution requires approval and is not enabled".to_owned())
             }
         },
     )
 }
+
+fn execute_request(
+    params: &ExecuteParams,
+    filesystem: &FileSystemCapability,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<String, String> {
+    execute_request_with_http_runner(
+        params,
+        filesystem,
+        pending_reviews,
+        |method, destination, body| {
+            let executor = HttpExecutor::new(HttpExecutionConfig::default())?;
+
+            executor.execute(method, destination, body)
+        },
+    )
+}
+
 #[tool_router(server_handler)]
 impl ZyguorGateway {
     #[tool(
@@ -999,13 +1233,16 @@ mod gateway_tests {
     use super::{
         AddArguments, AdminCommand, AdminOutcome, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
-        FileSystemCapability, MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision,
-        PolicyEvaluation, ReadFileArguments, ReviewedExecutionOutcome, WriteFileArguments,
+        FileSystemCapability, HttpExecutionResult, HttpMethod, MAX_ADMIN_COMMAND_LENGTH,
+        MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation, PolicyReason, ReadFileArguments,
+        ReviewedExecutionOutcome, ReviewedOperationResult, WriteFileArguments,
         audit_claimed_approval, build_execution_request, create_admin_listener, evaluate_request,
-        execute_message_with_audit_id, execute_request, handle_admin_command,
-        handle_admin_connection, parse_admin_command, reject_pending_request,
-        run_infinite_loop_with_fuel,
+        execute_message_with_audit_id, execute_request, execute_request_with_http_runner,
+        handle_admin_command, handle_admin_command_with_http_runner, handle_admin_connection,
+        parse_admin_command, reject_pending_request, revalidate_pending_request,
+        review_reason_for_request, run_infinite_loop_with_fuel,
     };
+    use crate::execution::HttpRequestArguments;
     use crate::pending_review::{PendingReview, PendingReviewStore};
     use crate::policy::evaluate_message;
     use std::sync::{Arc, Mutex};
@@ -1282,6 +1519,51 @@ mod gateway_tests {
         );
 
         assert_eq!(result, Err("pending review request not found".to_owned()));
+    }
+    #[test]
+    fn allows_http_get_to_allowlisted_host() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://api.example.com/status".to_owned(),
+            body: None,
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+    #[test]
+    fn blocks_http_request_to_unapproved_host() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://evil.example/status".to_owned(),
+            body: None,
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::OutOfScope);
+    }
+    #[test]
+    fn reviews_http_post_to_allowlisted_host() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Post,
+            url: "https://api.example.com/items".to_owned(),
+            body: Some(r#"{"name":"example"}"#.to_owned()),
+        });
+
+        let evaluation = evaluate_request(&request, &filesystem);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Review);
+        assert_eq!(evaluation.reason, PolicyReason::ExternalWrite);
     }
 
     #[test]
@@ -1577,6 +1859,9 @@ mod gateway_tests {
                 right: None,
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "run approved Rust tests".to_owned(),
@@ -1865,6 +2150,121 @@ mod tests {
 
         Ok(())
     }
+    #[test]
+    fn builds_http_get_execution_request() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "http_request".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+                method: Some("get".to_owned()),
+                url: Some("https://api.example.com/status".to_owned()),
+                body: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "read approved API status".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(
+            request,
+            ExecutionRequest::HttpRequest(HttpRequestArguments {
+                method: HttpMethod::Get,
+                url: "https://api.example.com/status".to_owned(),
+                body: None,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn builds_http_post_execution_request() -> Result<(), String> {
+        let params = ExecuteParams {
+            operation: "http_request".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+                method: Some("post".to_owned()),
+                url: Some("https://api.example.com/items".to_owned()),
+                body: Some(r#"{"name":"example"}"#.to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "send approved API request".to_owned(),
+            },
+        };
+
+        let request = build_execution_request(&params)?;
+
+        assert_eq!(
+            request,
+            ExecutionRequest::HttpRequest(HttpRequestArguments {
+                method: HttpMethod::Post,
+                url: "https://api.example.com/items".to_owned(),
+                body: Some(r#"{"name":"example"}"#.to_owned()),
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_http_method() {
+        let params = ExecuteParams {
+            operation: "http_request".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+                method: Some("delete".to_owned()),
+                url: Some("https://api.example.com/items".to_owned()),
+                body: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "unsupported HTTP method".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result,
+            Err("unsupported HTTP method: delete; expected get or post".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_http_get_with_body() {
+        let params = ExecuteParams {
+            operation: "http_request".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+                method: Some("get".to_owned()),
+                url: Some("https://api.example.com/status".to_owned()),
+                body: Some("unexpected body".to_owned()),
+            },
+            context: ExecutionContextParams {
+                purpose: "invalid GET body".to_owned(),
+            },
+        };
+
+        let result = build_execution_request(&params);
+
+        assert_eq!(
+            result,
+            Err("HTTP GET request must not include a body".to_owned())
+        );
+    }
 
     #[test]
     fn builds_add_execution_request() -> Result<(), String> {
@@ -1875,6 +2275,9 @@ mod tests {
                 right: Some(4),
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "test addition".to_owned(),
@@ -1890,7 +2293,8 @@ mod tests {
             ExecutionRequest::ReadFile(_)
             | ExecutionRequest::WriteFile(_)
             | ExecutionRequest::GitStatus
-            | ExecutionRequest::RunCargoTest => {
+            | ExecutionRequest::RunCargoTest
+            | ExecutionRequest::HttpRequest(_) => {
                 panic!("expected Add execution request");
             }
         }
@@ -2012,6 +2416,9 @@ mod tests {
                 right: None,
                 path: Some("README.md".to_owned()),
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -2027,7 +2434,8 @@ mod tests {
             ExecutionRequest::Add(_)
             | ExecutionRequest::WriteFile(_)
             | ExecutionRequest::GitStatus
-            | ExecutionRequest::RunCargoTest => {
+            | ExecutionRequest::RunCargoTest
+            | ExecutionRequest::HttpRequest(_) => {
                 panic!("expected ReadFile execution request");
             }
         }
@@ -2042,6 +2450,9 @@ mod tests {
                 right: None,
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -2065,6 +2476,9 @@ mod tests {
                 right: None,
                 path: Some("   ".to_owned()),
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "read project documentation".to_owned(),
@@ -2087,6 +2501,9 @@ mod tests {
                 right: None,
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "inspect repository status".to_owned(),
@@ -2109,6 +2526,9 @@ mod tests {
                 right: None,
                 path: Some("notes.txt".to_owned()),
                 content: Some("Hello from Zyguor".to_owned()),
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "prepare workspace update".to_owned(),
@@ -2125,7 +2545,8 @@ mod tests {
             ExecutionRequest::Add(_)
             | ExecutionRequest::ReadFile(_)
             | ExecutionRequest::GitStatus
-            | ExecutionRequest::RunCargoTest => {
+            | ExecutionRequest::RunCargoTest
+            | ExecutionRequest::HttpRequest(_) => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -2140,6 +2561,9 @@ mod tests {
                 right: None,
                 path: None,
                 content: Some("Hello from Zyguor".to_owned()),
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "prepare workspace update".to_owned(),
@@ -2163,6 +2587,9 @@ mod tests {
                 right: None,
                 path: Some("   ".to_owned()),
                 content: Some("Hello from Zyguor".to_owned()),
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "prepare workspace update".to_owned(),
@@ -2186,6 +2613,9 @@ mod tests {
                 right: None,
                 path: Some("notes.txt".to_owned()),
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "prepare workspace update".to_owned(),
@@ -2209,6 +2639,9 @@ mod tests {
                 right: None,
                 path: Some("empty.txt".to_owned()),
                 content: Some(String::new()),
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "prepare empty workspace file".to_owned(),
@@ -2225,7 +2658,8 @@ mod tests {
             ExecutionRequest::Add(_)
             | ExecutionRequest::ReadFile(_)
             | ExecutionRequest::GitStatus
-            | ExecutionRequest::RunCargoTest => {
+            | ExecutionRequest::RunCargoTest
+            | ExecutionRequest::HttpRequest(_) => {
                 panic!("expected WriteFile execution request");
             }
         }
@@ -2304,6 +2738,9 @@ mod tests {
                 right: None,
                 path: Some("new.txt".to_owned()),
                 content: Some("pending content".to_owned()),
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "Update application configuration".to_owned(),
@@ -2381,6 +2818,9 @@ mod tests {
                 right: Some(6),
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "test normalized operation".to_owned(),
@@ -2398,7 +2838,8 @@ mod tests {
             ExecutionRequest::ReadFile(_)
             | ExecutionRequest::WriteFile(_)
             | ExecutionRequest::GitStatus
-            | ExecutionRequest::RunCargoTest => {
+            | ExecutionRequest::RunCargoTest
+            | ExecutionRequest::HttpRequest(_) => {
                 panic!("expected Add execution request");
             }
         }
@@ -2415,6 +2856,9 @@ mod tests {
                 right: Some(2),
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "unsupported operation test".to_owned(),
@@ -2708,6 +3152,9 @@ mod tests {
                 right: Some(3),
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "delete the production database".to_owned(),
@@ -2756,6 +3203,9 @@ mod tests {
                 right: None,
                 path: Some("hello.txt".to_owned()),
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "read an approved workspace file".to_owned(),
@@ -2777,6 +3227,65 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace_root)
             .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn http_get_executes_through_gateway_with_injected_runner() -> Result<(), String> {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let pending_reviews = empty_pending_review_store();
+
+        let params = ExecuteParams {
+            operation: "http_request".to_owned(),
+            arguments: ExecutionArgumentsParams {
+                left: None,
+                right: None,
+                path: None,
+                content: None,
+                method: Some("get".to_owned()),
+                url: Some("https://api.example.com/status".to_owned()),
+                body: None,
+            },
+            context: ExecutionContextParams {
+                purpose: "read approved API status".to_owned(),
+            },
+        };
+
+        let result = execute_request_with_http_runner(
+            &params,
+            &filesystem,
+            &pending_reviews,
+            |method, destination, body| {
+                assert_eq!(method, HttpMethod::Get);
+                assert_eq!(
+                    destination.as_url().as_str(),
+                    "https://api.example.com/status"
+                );
+                assert!(body.is_none());
+
+                Ok(HttpExecutionResult {
+                    status_code: 200,
+                    body: "hello".to_owned(),
+                    body_truncated: false,
+                    duration_ms: 5,
+                })
+            },
+        )?;
+
+        let json: serde_json::Value = serde_json::from_str(&result)
+            .map_err(|error| format!("failed to parse gateway response: {error}"))?;
+
+        assert_eq!(json["decision"], "Allow");
+        assert_eq!(json["reason"], "Safe");
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["executed"], true);
+        assert_eq!(json["execution_outcome"], "Success");
+
+        assert_eq!(json["result"]["type"], "http");
+        assert_eq!(json["result"]["result"]["status_code"], 200);
+        assert_eq!(json["result"]["result"]["body"], "hello");
+        assert_eq!(json["result"]["result"]["body_truncated"], false);
+        assert_eq!(json["result"]["result"]["duration_ms"], 5);
 
         Ok(())
     }
@@ -2807,6 +3316,9 @@ mod tests {
                 right: None,
                 path: None,
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "inspect approved workspace repository".to_owned(),
@@ -2866,6 +3378,9 @@ mod tests {
                 right: None,
                 path: Some("../outside.txt".to_owned()),
                 content: None,
+                method: None,
+                url: None,
+                body: None,
             },
             context: ExecutionContextParams {
                 purpose: "attempt to read outside the approved workspace".to_owned(),
@@ -3191,6 +3706,183 @@ mod tests {
 
         Ok(())
     }
+    #[test]
+    fn approved_http_post_returns_completed_result() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::HttpRequest(HttpRequestArguments {
+                    method: HttpMethod::Post,
+                    url: "https://api.example.com/items".to_owned(),
+                    body: Some(r#"{"name":"zyguor"}"#.to_owned()),
+                }),
+                "Test approved HTTP POST".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let outcome = handle_admin_command_with_http_runner(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+            |arguments| {
+                assert_eq!(arguments.method, HttpMethod::Post);
+                assert_eq!(arguments.url, "https://api.example.com/items");
+
+                let result = HttpExecutionResult {
+                    status_code: 200,
+                    body: r#"{"ok":true}"#.to_owned(),
+                    body_truncated: false,
+                    duration_ms: 5,
+                };
+
+                Ok(ReviewedOperationResult::Success(Some(
+                    ExecutionResult::Http { result },
+                )))
+            },
+        )?;
+
+        match outcome {
+            AdminOutcome::HttpPostCompleted {
+                request_id: completed_request_id,
+                result,
+            } => {
+                assert_eq!(completed_request_id, request_id);
+                assert_eq!(result.status_code, 200);
+                assert_eq!(result.body, r#"{"ok":true}"#);
+                assert!(!result.body_truncated);
+            }
+
+            other => {
+                return Err(format!(
+                    "expected HTTP POST completed outcome, got {other:?}"
+                ));
+            }
+        }
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_none());
+
+        Ok(())
+    }
+    #[test]
+    fn approved_http_post_preserves_failed_http_result() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::HttpRequest(HttpRequestArguments {
+                    method: HttpMethod::Post,
+                    url: "https://api.example.com/items".to_owned(),
+                    body: Some(r#"{"name":"zyguor"}"#.to_owned()),
+                }),
+                "Test failed HTTP POST response".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let outcome = handle_admin_command_with_http_runner(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+            |_arguments| {
+                let result = HttpExecutionResult {
+                    status_code: 500,
+                    body: r#"{"error":"server failure"}"#.to_owned(),
+                    body_truncated: false,
+                    duration_ms: 8,
+                };
+
+                Ok(ReviewedOperationResult::FailedWithResult {
+                    error: "HTTP POST returned status 500".to_owned(),
+                    result: ExecutionResult::Http { result },
+                })
+            },
+        )?;
+
+        match outcome {
+            AdminOutcome::HttpPostFailed {
+                request_id: failed_request_id,
+                result,
+            } => {
+                assert_eq!(failed_request_id, request_id);
+                assert_eq!(result.status_code, 500);
+                assert_eq!(result.body, r#"{"error":"server failure"}"#);
+            }
+
+            other => {
+                return Err(format!("expected HTTP POST failed outcome, got {other:?}"));
+            }
+        }
+
+        Ok(())
+    }
+    #[test]
+    fn approved_http_post_reports_transport_failure() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(crate::pending_review::PendingReview::new(
+                request_id,
+                ExecutionRequest::HttpRequest(HttpRequestArguments {
+                    method: HttpMethod::Post,
+                    url: "https://api.example.com/items".to_owned(),
+                    body: None,
+                }),
+                "Test HTTP POST transport failure".to_owned(),
+            ))?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let outcome = handle_admin_command_with_http_runner(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+            |_arguments| Err("HTTP request failed: simulated transport failure".to_owned()),
+        )?;
+
+        match outcome {
+            AdminOutcome::HttpPostExecutionFailed {
+                request_id: failed_request_id,
+                error,
+            } => {
+                assert_eq!(failed_request_id, request_id);
+                assert_eq!(error, "HTTP request failed: simulated transport failure");
+            }
+
+            other => {
+                return Err(format!(
+                    "expected HTTP POST execution failure, got {other:?}"
+                ));
+            }
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn approval_audit_failure_is_propagated() -> Result<(), String> {
@@ -3255,6 +3947,55 @@ mod tests {
         );
 
         Ok(())
+    }
+    #[test]
+    fn http_post_uses_external_write_review_reason() -> Result<(), String> {
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Post,
+            url: "https://api.example.com/items".to_owned(),
+            body: Some(r#"{"name":"zyguor"}"#.to_owned()),
+        });
+
+        let reason = review_reason_for_request(&request)?;
+
+        assert_eq!(reason, PolicyReason::ExternalWrite);
+
+        Ok(())
+    }
+
+    #[test]
+    fn http_get_is_not_eligible_for_human_review() {
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://api.example.com/status".to_owned(),
+            body: None,
+        });
+
+        let result = review_reason_for_request(&request);
+
+        assert_eq!(
+            result,
+            Err("request is not eligible for human review".to_owned())
+        );
+    }
+
+    #[test]
+    fn pending_http_post_revalidation_rejects_unapproved_destination() {
+        let pending = PendingReview::new(
+            uuid::Uuid::new_v4(),
+            ExecutionRequest::HttpRequest(HttpRequestArguments {
+                method: HttpMethod::Post,
+                url: "https://not-allowed.example.com/items".to_owned(),
+                body: Some(r#"{"name":"zyguor"}"#.to_owned()),
+            }),
+            "submit external API request".to_owned(),
+        );
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let result = revalidate_pending_request(&pending, &filesystem);
+
+        assert!(result.is_err());
     }
     #[test]
     fn rejection_audit_failure_restores_claimed_request() -> Result<(), String> {

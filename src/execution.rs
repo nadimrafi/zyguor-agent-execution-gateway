@@ -14,6 +14,19 @@ pub struct WriteFileArguments {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequestArguments {
+    pub method: HttpMethod,
+    pub url: String,
+    pub body: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionRequest {
     Add(AddArguments),
@@ -21,4 +34,5 @@ pub enum ExecutionRequest {
     WriteFile(WriteFileArguments),
     GitStatus,
     RunCargoTest,
+    HttpRequest(HttpRequestArguments),
 }

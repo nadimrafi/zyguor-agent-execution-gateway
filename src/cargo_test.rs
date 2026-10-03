@@ -184,11 +184,11 @@ impl CargoTestExecutor {
             }
         };
 
-        // Cargo may have exited while one of its descendants remains alive.
-        // Best-effort process-group cleanup prevents ordinary descendants from
-        // continuing after the reviewed Cargo operation has completed.
-        terminate_process_group(process_id)?;
-
+        // Cargo may have exited normally while one of its descendants remains alive.
+        // On timeout, the process group has already been terminated above.
+        if !timed_out {
+            terminate_process_group(process_id)?;
+        }
         let stdout_result = read_capture_file(&stdout_path, self.config.max_stdout_bytes);
         let stderr_result = read_capture_file(&stderr_path, self.config.max_stderr_bytes);
 
