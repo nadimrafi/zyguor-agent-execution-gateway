@@ -1,5 +1,6 @@
 mod audit;
 mod cargo_test;
+mod config;
 mod execution;
 mod filesystem;
 mod git;
@@ -8,9 +9,9 @@ mod http_execution;
 mod pending_review;
 mod policy;
 mod sandbox;
-
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use cargo_test::{CargoTestExecutor, CargoTestResult};
+use config::{GatewayConfig, resolve_gateway_config};
 use execution::{
     AddArguments, ExecutionRequest, HttpMethod, HttpRequestArguments, ReadFileArguments,
     WriteFileArguments,
@@ -18,13 +19,14 @@ use execution::{
 use filesystem::FileSystemCapability;
 use git::read_git_status;
 use http::{ValidatedHttpUrl, validate_http_destination};
-use http_execution::{HttpExecutionConfig, HttpExecutionResult, HttpExecutor};
+use http_execution::{HttpExecutionResult, HttpExecutor};
 use pending_review::{PendingReview, PendingReviewStore};
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, PolicyReason, block_out_of_scope,
-    evaluate_operation,
+    evaluate_operation_with_config,
 };
-use sandbox::{SandboxConfig, SandboxExecutor};
+use sandbox::SandboxExecutor;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -130,7 +132,9 @@ struct GatewayResponse<'a> {
 struct ZyguorGateway {
     filesystem: FileSystemCapability,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
+    config: Arc<GatewayConfig>,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminCommand {
     Approve { request_id: uuid::Uuid },
@@ -269,7 +273,7 @@ fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
 
 const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_ADMIN_COMMAND_LENGTH: usize = 256;
-const HTTP_ALLOWED_HOSTS: &[&str] = &["api.example.com"];
+
 fn validate_message(message: &str) -> Result<(), String> {
     if message.trim().is_empty() {
         return Err("message cannot be empty".to_owned());
@@ -457,29 +461,41 @@ fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, S
     }
 }
 
-fn evaluate_request(
+fn evaluate_request_with_config(
     request: &ExecutionRequest,
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
 ) -> PolicyEvaluation {
     match request {
-        ExecutionRequest::Add(_) => evaluate_operation(PolicyOperation::Add),
+        ExecutionRequest::Add(_) => {
+            evaluate_operation_with_config(PolicyOperation::Add, &config.policy)
+        }
+
         ExecutionRequest::HttpRequest(arguments) => {
-            if validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS).is_err() {
+            if validate_http_destination(&arguments.url, &config.http.allowed_hosts).is_err() {
                 return block_out_of_scope();
             }
 
             match arguments.method {
-                HttpMethod::Get => evaluate_operation(PolicyOperation::HttpGet),
-                HttpMethod::Post => evaluate_operation(PolicyOperation::HttpPost),
+                HttpMethod::Get => {
+                    evaluate_operation_with_config(PolicyOperation::HttpGet, &config.policy)
+                }
+
+                HttpMethod::Post => {
+                    evaluate_operation_with_config(PolicyOperation::HttpPost, &config.policy)
+                }
             }
         }
 
-        ExecutionRequest::RunCargoTest => evaluate_operation(PolicyOperation::RunCargoTest),
+        ExecutionRequest::RunCargoTest => {
+            evaluate_operation_with_config(PolicyOperation::RunCargoTest, &config.policy)
+        }
+
         ExecutionRequest::ReadFile(arguments) => {
             if filesystem.resolve_existing_path(&arguments.path).is_err() {
                 block_out_of_scope()
             } else {
-                evaluate_operation(PolicyOperation::ReadFile)
+                evaluate_operation_with_config(PolicyOperation::ReadFile, &config.policy)
             }
         }
 
@@ -487,10 +503,13 @@ fn evaluate_request(
             if filesystem.resolve_write_target(&arguments.path).is_err() {
                 block_out_of_scope()
             } else {
-                evaluate_operation(PolicyOperation::WriteFile)
+                evaluate_operation_with_config(PolicyOperation::WriteFile, &config.policy)
             }
         }
-        ExecutionRequest::GitStatus => evaluate_operation(PolicyOperation::GitStatus),
+
+        ExecutionRequest::GitStatus => {
+            evaluate_operation_with_config(PolicyOperation::GitStatus, &config.policy)
+        }
     }
 }
 
@@ -542,9 +561,10 @@ fn review_reason_for_request(request: &ExecutionRequest) -> Result<PolicyReason,
         _ => Err("request is not eligible for human review".to_owned()),
     }
 }
-fn revalidate_pending_request(
+fn revalidate_pending_request_with_config(
     pending: &PendingReview,
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
 ) -> Result<(), String> {
     match &pending.request {
         ExecutionRequest::WriteFile(arguments) => filesystem
@@ -555,8 +575,9 @@ fn revalidate_pending_request(
             .resolve_existing_path("Cargo.toml")
             .map(|_| ())
             .map_err(|error| format!("pending Cargo test workspace is no longer valid: {error}")),
+
         ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
-            validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)
+            validate_http_destination(&arguments.url, &config.http.allowed_hosts)
                 .map(|_| ())
                 .map_err(|error| {
                     format!("pending HTTP POST destination is no longer valid: {error}")
@@ -566,6 +587,7 @@ fn revalidate_pending_request(
         _ => Err("pending request is not eligible for approval".to_owned()),
     }
 }
+
 fn write_approval_audit<F>(pending: &PendingReview, mut audit_writer: F) -> Result<(), String>
 where
     F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
@@ -638,11 +660,11 @@ where
 
     Ok(())
 }
-fn execute_cargo_test(
+fn execute_cargo_test_with_config(
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
 ) -> Result<ReviewedOperationResult, String> {
-    let executor = CargoTestExecutor::new(Default::default());
-
+    let executor = CargoTestExecutor::new(config.cargo_test);
     let result = executor.run(filesystem.workspace_root())?;
 
     let execution_result = ExecutionResult::CargoTest {
@@ -667,14 +689,16 @@ fn execute_cargo_test(
         })
     }
 }
-fn execute_http_post(arguments: &HttpRequestArguments) -> Result<ReviewedOperationResult, String> {
+fn execute_http_post_with_config(
+    arguments: &HttpRequestArguments,
+    config: &GatewayConfig,
+) -> Result<ReviewedOperationResult, String> {
     if arguments.method != HttpMethod::Post {
         return Err("reviewed HTTP execution requires POST".to_owned());
     }
+    let destination = validate_http_destination(&arguments.url, &config.http.allowed_hosts)?;
 
-    let destination = validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)?;
-
-    let executor = HttpExecutor::new(HttpExecutionConfig::default())?;
+    let executor = HttpExecutor::new(config.http.execution)?;
 
     let result = executor.execute(HttpMethod::Post, &destination, arguments.body.as_deref())?;
 
@@ -691,6 +715,7 @@ fn execute_http_post(arguments: &HttpRequestArguments) -> Result<ReviewedOperati
         })
     }
 }
+
 fn execute_reviewed_action<F, W>(
     pending: &PendingReview,
     mut audit_writer: F,
@@ -830,6 +855,7 @@ fn handle_admin_command_with_http_runner<H>(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
     http_post_runner: H,
 ) -> Result<AdminOutcome, String>
 where
@@ -839,7 +865,7 @@ where
         AdminCommand::Approve { request_id } => {
             let pending = inspect_pending_request(request_id, pending_reviews)?;
 
-            revalidate_pending_request(&pending, filesystem)?;
+            revalidate_pending_request_with_config(&pending, filesystem, config)?;
 
             let mut store = pending_reviews
                 .lock()
@@ -888,7 +914,7 @@ where
                         &claimed,
                         pending_reviews,
                         persist_audit,
-                        || execute_cargo_test(filesystem),
+                        || execute_cargo_test_with_config(filesystem, config),
                     )?;
 
                     match outcome {
@@ -986,25 +1012,33 @@ where
         }
     }
 }
-fn handle_admin_command(
+fn handle_admin_command_with_config(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
 ) -> Result<AdminOutcome, String> {
-    handle_admin_command_with_http_runner(command, pending_reviews, filesystem, execute_http_post)
+    handle_admin_command_with_http_runner(
+        command,
+        pending_reviews,
+        filesystem,
+        config,
+        |arguments| execute_http_post_with_config(arguments, config),
+    )
 }
 
 fn execute_request_with_http_runner<H>(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    config: &GatewayConfig,
     http_runner: H,
 ) -> Result<String, String>
 where
     H: FnOnce(HttpMethod, &ValidatedHttpUrl, Option<&str>) -> Result<HttpExecutionResult, String>,
 {
     let request = build_execution_request(params)?;
-    let evaluation = evaluate_request(&request, filesystem);
+    let evaluation = evaluate_request_with_config(&request, filesystem, config);
     let request_id = uuid::Uuid::new_v4();
 
     if evaluation.decision == PolicyDecision::Review {
@@ -1018,7 +1052,7 @@ where
         store.insert(pending)?;
     }
 
-    let executor = SandboxExecutor::new(SandboxConfig::default());
+    let executor = SandboxExecutor::new(config.sandbox);
 
     execute_message_with_audit_id(
         request_id,
@@ -1029,7 +1063,7 @@ where
             ExecutionRequest::HttpRequest(arguments) => match arguments.method {
                 HttpMethod::Get => {
                     let destination =
-                        validate_http_destination(&arguments.url, HTTP_ALLOWED_HOSTS)?;
+                        validate_http_destination(&arguments.url, &config.http.allowed_hosts)?;
 
                     http_runner(HttpMethod::Get, &destination, arguments.body.as_deref())
                         .map(|result| ExecutionResult::Http { result })
@@ -1067,17 +1101,19 @@ where
     )
 }
 
-fn execute_request(
+fn execute_request_with_config(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    config: &GatewayConfig,
 ) -> Result<String, String> {
     execute_request_with_http_runner(
         params,
         filesystem,
         pending_reviews,
+        config,
         |method, destination, body| {
-            let executor = HttpExecutor::new(HttpExecutionConfig::default())?;
+            let executor = HttpExecutor::new(config.http.execution)?;
 
             executor.execute(method, destination, body)
         },
@@ -1090,7 +1126,12 @@ impl ZyguorGateway {
         description = "Evaluates and executes structured requests through Zyguor policy-controlled execution capabilities."
     )]
     fn execute(&self, Parameters(params): Parameters<ExecuteParams>) -> String {
-        match execute_request(&params, &self.filesystem, &self.pending_reviews) {
+        match execute_request_with_config(
+            &params,
+            &self.filesystem,
+            &self.pending_reviews,
+            self.config.as_ref(),
+        ) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
         }
@@ -1116,6 +1157,7 @@ async fn handle_admin_connection(
     stream: tokio::net::UnixStream,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
+    config: &GatewayConfig,
 ) -> Result<AdminOutcome, String> {
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
@@ -1146,7 +1188,9 @@ async fn handle_admin_connection(
     }
 
     let result = match parse_admin_command(&input) {
-        Ok(command) => handle_admin_command(command, pending_reviews, filesystem),
+        Ok(command) => {
+            handle_admin_command_with_config(command, pending_reviews, filesystem, config)
+        }
         Err(error) => Err(error),
     };
 
@@ -1181,6 +1225,7 @@ async fn run_admin_listener(
     listener: UnixListener,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     filesystem: FileSystemCapability,
+    config: Arc<GatewayConfig>,
 ) -> Result<(), String> {
     loop {
         let (stream, _) = listener
@@ -1188,7 +1233,9 @@ async fn run_admin_listener(
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
-        if let Err(error) = handle_admin_connection(stream, &pending_reviews, &filesystem).await {
+        if let Err(error) =
+            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await
+        {
             eprintln!("admin command rejected: {error}");
         }
     }
@@ -1198,8 +1245,24 @@ async fn run_admin_listener(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::var("ZYGUOR_WORKSPACE_ROOT")
         .map_err(|_| "ZYGUOR_WORKSPACE_ROOT must be configured")?;
+
     let admin_socket_path = std::env::var("ZYGUOR_ADMIN_SOCKET")
         .map_err(|_| "ZYGUOR_ADMIN_SOCKET must be configured")?;
+
+    let config_path = match std::env::var("ZYGUOR_CONFIG_PATH") {
+        Ok(path) => Some(path),
+
+        Err(std::env::VarError::NotPresent) => None,
+
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("ZYGUOR_CONFIG_PATH must contain valid UTF-8".into());
+        }
+    };
+
+    let config = resolve_gateway_config(config_path.as_deref().map(Path::new))
+        .map_err(|error| format!("failed to resolve gateway configuration: {error}"))?;
+
+    let config = Arc::new(config);
 
     let admin_listener = create_admin_listener(Path::new(&admin_socket_path)).await?;
 
@@ -1210,12 +1273,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway = ZyguorGateway {
         filesystem: filesystem.clone(),
         pending_reviews: Arc::clone(&pending_reviews),
+        config: Arc::clone(&config),
     };
 
     let admin_task = tokio::spawn(run_admin_listener(
         admin_listener,
         Arc::clone(&pending_reviews),
         filesystem,
+        Arc::clone(&config),
     ));
 
     let service = gateway.serve(stdio()).await?;
@@ -1226,6 +1291,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+#[cfg(test)]
+fn evaluate_request(
+    request: &ExecutionRequest,
+    filesystem: &FileSystemCapability,
+) -> PolicyEvaluation {
+    let config = GatewayConfig::default();
+
+    evaluate_request_with_config(request, filesystem, &config)
+}
+#[cfg(test)]
+fn revalidate_pending_request(
+    pending: &PendingReview,
+    filesystem: &FileSystemCapability,
+) -> Result<(), String> {
+    let config = GatewayConfig::default();
+
+    revalidate_pending_request_with_config(pending, filesystem, &config)
+}
+#[cfg(test)]
+fn handle_admin_command(
+    command: AdminCommand,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+    filesystem: &FileSystemCapability,
+) -> Result<AdminOutcome, String> {
+    let config = GatewayConfig::default();
+
+    handle_admin_command_with_config(command, pending_reviews, filesystem, &config)
+}
+#[cfg(test)]
+fn execute_request(
+    params: &ExecuteParams,
+    filesystem: &FileSystemCapability,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<String, String> {
+    let config = GatewayConfig::default();
+
+    execute_request_with_config(params, filesystem, pending_reviews, &config)
+}
 
 #[cfg(test)]
 mod gateway_tests {
@@ -1233,10 +1336,11 @@ mod gateway_tests {
     use super::{
         AddArguments, AdminCommand, AdminOutcome, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
-        FileSystemCapability, HttpExecutionResult, HttpMethod, MAX_ADMIN_COMMAND_LENGTH,
-        MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation, PolicyReason, ReadFileArguments,
-        ReviewedExecutionOutcome, ReviewedOperationResult, WriteFileArguments,
-        audit_claimed_approval, build_execution_request, create_admin_listener, evaluate_request,
+        FileSystemCapability, GatewayConfig, HttpExecutionResult, HttpMethod,
+        MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation,
+        PolicyReason, ReadFileArguments, ReviewedExecutionOutcome, ReviewedOperationResult,
+        WriteFileArguments, audit_claimed_approval, build_execution_request, create_admin_listener,
+        evaluate_request, evaluate_request_with_config, execute_http_post_with_config,
         execute_message_with_audit_id, execute_request, execute_request_with_http_runner,
         handle_admin_command, handle_admin_command_with_http_runner, handle_admin_connection,
         parse_admin_command, reject_pending_request, revalidate_pending_request,
@@ -1349,7 +1453,9 @@ mod gateway_tests {
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
-        let rejected = handle_admin_connection(stream, &pending_reviews, &filesystem).await?;
+        let config = GatewayConfig::default();
+        let rejected =
+            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await?;
 
         let response = client
             .await
@@ -1474,7 +1580,9 @@ mod gateway_tests {
 
         let filesystem = FileSystemCapability::try_new(workspace.clone())?;
 
-        let outcome = handle_admin_connection(stream, &pending_reviews, &filesystem).await?;
+        let config = GatewayConfig::default();
+        let outcome =
+            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await?;
 
         let response = client
             .await
@@ -1506,6 +1614,7 @@ mod gateway_tests {
 
         Ok(())
     }
+
     #[test]
     fn approval_of_unknown_request_is_rejected() {
         let pending_reviews = empty_pending_review_store();
@@ -1520,6 +1629,7 @@ mod gateway_tests {
 
         assert_eq!(result, Err("pending review request not found".to_owned()));
     }
+
     #[test]
     fn allows_http_get_to_allowlisted_host() {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
@@ -1535,6 +1645,7 @@ mod gateway_tests {
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert_eq!(evaluation.reason, PolicyReason::Safe);
     }
+
     #[test]
     fn blocks_http_request_to_unapproved_host() {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
@@ -1672,7 +1783,8 @@ mod gateway_tests {
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
+        let config = GatewayConfig::default();
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
 
         let response = client
             .await
@@ -1738,8 +1850,9 @@ mod gateway_tests {
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
 
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
 
         let response = client
             .await
@@ -1797,8 +1910,9 @@ mod gateway_tests {
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
 
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem).await;
+        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
 
         let response = client
             .await
@@ -2264,6 +2378,61 @@ mod tests {
             result,
             Err("HTTP GET request must not include a body".to_owned())
         );
+    }
+    #[test]
+    fn configured_http_request_body_limit_is_enforced() {
+        let arguments = HttpRequestArguments {
+            method: HttpMethod::Post,
+            url: "https://api.example.com/items".to_owned(),
+            body: Some("123456".to_owned()),
+        };
+
+        let mut config = GatewayConfig::default();
+        config.http.execution.max_request_body_bytes = 5;
+
+        let result = execute_http_post_with_config(&arguments, &config);
+
+        assert_eq!(
+            result,
+            Err("HTTP request body exceeds maximum size of 5 bytes".to_owned())
+        );
+    }
+    #[test]
+    fn custom_http_allowlist_changes_policy_decision() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://custom.example.com/status".to_owned(),
+            body: None,
+        });
+
+        let mut config = GatewayConfig::default();
+        config.http.allowed_hosts = vec!["custom.example.com".to_owned()];
+
+        let evaluation = evaluate_request_with_config(&request, &filesystem, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+
+    #[test]
+    fn empty_http_allowlist_blocks_outbound_http() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://api.example.com/status".to_owned(),
+            body: None,
+        });
+
+        let mut config = GatewayConfig::default();
+        config.http.allowed_hosts.clear();
+
+        let evaluation = evaluate_request_with_config(&request, &filesystem, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::OutOfScope);
     }
 
     #[test]
@@ -3251,10 +3420,13 @@ mod tests {
             },
         };
 
+        let config = GatewayConfig::default();
+
         let result = execute_request_with_http_runner(
             &params,
             &filesystem,
             &pending_reviews,
+            &config,
             |method, destination, body| {
                 assert_eq!(method, HttpMethod::Get);
                 assert_eq!(
@@ -3729,10 +3901,12 @@ mod tests {
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
 
+        let config = GatewayConfig::default();
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
+            &config,
             |arguments| {
                 assert_eq!(arguments.method, HttpMethod::Post);
                 assert_eq!(arguments.url, "https://api.example.com/items");
@@ -3799,10 +3973,12 @@ mod tests {
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
 
+        let config = GatewayConfig::default();
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
+            &config,
             |_arguments| {
                 let result = HttpExecutionResult {
                     status_code: 500,
@@ -3857,11 +4033,13 @@ mod tests {
         }
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
 
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
+            &config,
             |_arguments| Err("HTTP request failed: simulated transport failure".to_owned()),
         )?;
 
@@ -4403,6 +4581,54 @@ mod tests {
                 (AuditPhase::Completion, ExecutionOutcome::Success),
             ]
         );
+
+        Ok(())
+    }
+    #[test]
+    fn configured_http_get_block_applies_to_gateway_policy() {
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+
+        let request = ExecutionRequest::HttpRequest(HttpRequestArguments {
+            method: HttpMethod::Get,
+            url: "https://api.example.com/status".to_owned(),
+            body: None,
+        });
+
+        let mut config = GatewayConfig::default();
+        config.policy.http_get = PolicyDecision::Block;
+
+        let evaluation = evaluate_request_with_config(&request, &filesystem, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+    #[test]
+    fn configured_write_file_block_applies_to_in_scope_request() -> Result<(), String> {
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-configured-write-policy-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let request = ExecutionRequest::WriteFile(WriteFileArguments {
+            path: "settings.txt".to_owned(),
+            content: "enabled=true".to_owned(),
+        });
+
+        let mut config = GatewayConfig::default();
+        config.policy.write_file = PolicyDecision::Block;
+
+        let evaluation = evaluate_request_with_config(&request, &filesystem, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::Write);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
 
         Ok(())
     }

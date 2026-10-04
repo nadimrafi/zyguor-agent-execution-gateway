@@ -1,3 +1,47 @@
+use crate::config::CapabilityPolicyConfig;
+
+pub fn evaluate_operation_with_config(
+    operation: PolicyOperation,
+    config: &CapabilityPolicyConfig,
+) -> PolicyEvaluation {
+    match operation {
+        PolicyOperation::Add => PolicyEvaluation {
+            decision: config.add,
+            reason: PolicyReason::Safe,
+        },
+
+        PolicyOperation::ReadFile => PolicyEvaluation {
+            decision: config.read_file,
+            reason: PolicyReason::Safe,
+        },
+
+        PolicyOperation::WriteFile => PolicyEvaluation {
+            decision: config.write_file,
+            reason: PolicyReason::Write,
+        },
+
+        PolicyOperation::GitStatus => PolicyEvaluation {
+            decision: config.git_status,
+            reason: PolicyReason::Safe,
+        },
+
+        PolicyOperation::RunCargoTest => PolicyEvaluation {
+            decision: config.run_cargo_test,
+            reason: PolicyReason::CodeExecution,
+        },
+
+        PolicyOperation::HttpGet => PolicyEvaluation {
+            decision: config.http_get,
+            reason: PolicyReason::Safe,
+        },
+
+        PolicyOperation::HttpPost => PolicyEvaluation {
+            decision: config.http_post,
+            reason: PolicyReason::ExternalWrite,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[allow(dead_code)]
 pub enum PolicyDecision {
@@ -34,6 +78,7 @@ pub enum PolicyOperation {
     HttpPost,
 }
 
+#[cfg(test)]
 pub fn evaluate_operation(operation: PolicyOperation) -> PolicyEvaluation {
     match operation {
         PolicyOperation::Add | PolicyOperation::ReadFile | PolicyOperation::GitStatus => {
@@ -102,8 +147,9 @@ pub fn evaluate_message(message: &str) -> PolicyEvaluation {
 mod tests {
     use super::{
         PolicyDecision, PolicyOperation, PolicyReason, block_out_of_scope, evaluate_message,
-        evaluate_operation,
+        evaluate_operation, evaluate_operation_with_config,
     };
+    use crate::config::CapabilityPolicyConfig;
 
     #[test]
     fn blocks_out_of_scope_resource() {
@@ -203,5 +249,30 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Review);
         assert_eq!(evaluation.reason, PolicyReason::ExternalWrite);
+    }
+    #[test]
+    fn configured_http_get_can_be_blocked() {
+        let config = CapabilityPolicyConfig {
+            http_get: PolicyDecision::Block,
+            ..CapabilityPolicyConfig::default()
+        };
+
+        let evaluation = evaluate_operation_with_config(PolicyOperation::HttpGet, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::Safe);
+    }
+
+    #[test]
+    fn configured_write_file_can_be_blocked() {
+        let config = CapabilityPolicyConfig {
+            write_file: PolicyDecision::Block,
+            ..CapabilityPolicyConfig::default()
+        };
+
+        let evaluation = evaluate_operation_with_config(PolicyOperation::WriteFile, &config);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
+        assert_eq!(evaluation.reason, PolicyReason::Write);
     }
 }

@@ -15,10 +15,13 @@ impl ValidatedHttpUrl {
     }
 }
 
-pub fn validate_http_destination(
+pub fn validate_http_destination<S>(
     input: &str,
-    allowed_hosts: &[&str],
-) -> Result<ValidatedHttpUrl, String> {
+    allowed_hosts: &[S],
+) -> Result<ValidatedHttpUrl, String>
+where
+    S: AsRef<str>,
+{
     let url = Url::parse(input).map_err(|error| format!("invalid HTTP URL: {error}"))?;
 
     if url.scheme() != "https" {
@@ -49,7 +52,7 @@ pub fn validate_http_destination(
 
     let allowed = allowed_hosts
         .iter()
-        .any(|allowed_host| host.eq_ignore_ascii_case(allowed_host));
+        .any(|allowed_host| host.eq_ignore_ascii_case(allowed_host.as_ref()));
 
     if !allowed {
         return Err("HTTP destination host is not allowlisted".to_owned());
