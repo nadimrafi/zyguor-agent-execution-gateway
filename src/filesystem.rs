@@ -178,6 +178,7 @@ impl FileSystemCapability {
                 "write content exceeds maximum size of {MAX_WRITE_BYTES} bytes"
             ));
         }
+
         let relative_path = Path::new(requested_path);
 
         if relative_path.is_absolute() {
@@ -189,31 +190,88 @@ impl FileSystemCapability {
                 Component::ParentDir => {
                     return Err("parent directory traversal is not allowed".to_owned());
                 }
+
                 Component::RootDir | Component::Prefix(_) => {
                     return Err("path must remain inside the workspace".to_owned());
                 }
+
                 Component::CurDir | Component::Normal(_) => {}
             }
         }
+
+        relative_path
+            .file_name()
+            .ok_or_else(|| "write target must include a file name".to_owned())?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
 
         let workspace = self
             .workspace_dir
             .as_ref()
             .ok_or_else(|| "secure write requires an anchored workspace capability".to_owned())?;
 
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        self.revalidate_write_target(requested_path)?;
 
+        let existing_permissions = match workspace.symlink_metadata(relative_path) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read existing write target metadata: {error}"
+                ));
+            }
+        };
+
+        let temporary_name = format!(".zyguor-write-{}.tmp", uuid::Uuid::new_v4());
+
+        let temporary_path = if parent.as_os_str().is_empty() {
+            PathBuf::from(&temporary_name)
+        } else {
+            parent.join(&temporary_name)
+        };
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         options.follow(FollowSymlinks::No);
 
-        let mut file = workspace
-            .open_with(relative_path, &options)
-            .map_err(|error| format!("failed to open requested file for writing: {error}"))?;
+        let write_result = (|| -> Result<(), String> {
+            let mut temporary_file = workspace
+                .open_with(&temporary_path, &options)
+                .map_err(|error| format!("failed to create temporary write file: {error}"))?;
 
-        file.write_all(content.as_bytes())
-            .map_err(|error| format!("failed to write requested file: {error}"))
+            if let Some(permissions) = existing_permissions {
+                temporary_file
+                    .set_permissions(permissions)
+                    .map_err(|error| {
+                        format!("failed to preserve existing file permissions: {error}")
+                    })?;
+            }
+
+            temporary_file
+                .write_all(content.as_bytes())
+                .map_err(|error| format!("failed to write temporary file: {error}"))?;
+
+            temporary_file
+                .sync_all()
+                .map_err(|error| format!("failed to sync temporary file: {error}"))?;
+
+            drop(temporary_file);
+
+            workspace
+                .rename(&temporary_path, workspace, relative_path)
+                .map_err(|error| format!("failed to atomically replace requested file: {error}"))?;
+
+            Ok(())
+        })();
+        if write_result.is_err() {
+            match workspace.remove_file(&temporary_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+
+        write_result
     }
-
     pub fn read_text_file(&self, requested_path: &str) -> Result<String, String> {
         let resolved_path = self.resolve_existing_path(requested_path)?;
 
@@ -1125,6 +1183,55 @@ mod tests {
 
         Ok(())
     }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_replaces_existing_file_atomically() -> Result<(), String> {
+        use std::fs::{self, File};
+        use std::io::{Read, Seek, SeekFrom};
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-atomic-write-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target = workspace.join("settings.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&target, "old-value")
+            .map_err(|error| format!("failed to create existing file: {error}"))?;
+
+        let mut old_handle = File::open(&target)
+            .map_err(|error| format!("failed to open existing file: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        capability.write_text_file("settings.txt", "new-value")?;
+
+        let current_content = fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read replacement file: {error}"))?;
+
+        assert_eq!(current_content, "new-value");
+
+        old_handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("failed to seek old file handle: {error}"))?;
+
+        let mut old_content = String::new();
+
+        old_handle
+            .read_to_string(&mut old_content)
+            .map_err(|error| format!("failed to read old file handle: {error}"))?;
+
+        assert_eq!(old_content, "old-value");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
     #[test]
     fn secure_write_rejects_missing_parent_directory() -> Result<(), String> {
         use std::fs;
@@ -1172,6 +1279,44 @@ mod tests {
 
         assert!(result.is_err());
         assert!(target_directory.is_dir());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn secure_write_preserves_existing_file_permissions() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-write-permissions-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let target = workspace.join("settings.txt");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::write(&target, "old-value")
+            .map_err(|error| format!("failed to create existing file: {error}"))?;
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("failed to set test permissions: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        capability.write_text_file("settings.txt", "new-value")?;
+
+        let permissions = fs::metadata(&target)
+            .map_err(|error| format!("failed to read replacement metadata: {error}"))?
+            .permissions();
+
+        assert_eq!(permissions.mode() & 0o777, 0o600);
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
