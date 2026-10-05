@@ -1,8 +1,17 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::execution::ExecutionRequest;
+use crate::execution::{ExecutionRequest, HttpMethod, HttpRequestArguments, WriteFileArguments};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingReview {
@@ -20,9 +29,102 @@ impl PendingReview {
         }
     }
 }
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedPendingReviewState {
+    version: u32,
+    reviews: Vec<PersistedPendingReview>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedPendingReview {
+    request_id: Uuid,
+    purpose: String,
+    status: PersistedReviewStatus,
+    operation: PersistedReviewOperation,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PersistedReviewStatus {
+    Pending,
+    Claimed,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedReviewOperation {
+    WriteFile { path: String, content: String },
+    RunCargoTest,
+    HttpPost { url: String, body: Option<String> },
+}
+impl TryFrom<&PendingReview> for PersistedPendingReview {
+    type Error = String;
+
+    fn try_from(pending: &PendingReview) -> Result<Self, Self::Error> {
+        let operation = match &pending.request {
+            ExecutionRequest::WriteFile(arguments) => PersistedReviewOperation::WriteFile {
+                path: arguments.path.clone(),
+                content: arguments.content.clone(),
+            },
+
+            ExecutionRequest::RunCargoTest => PersistedReviewOperation::RunCargoTest,
+
+            ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
+                PersistedReviewOperation::HttpPost {
+                    url: arguments.url.clone(),
+                    body: arguments.body.clone(),
+                }
+            }
+
+            _ => {
+                return Err("only reviewable privileged operations can be persisted".to_owned());
+            }
+        };
+
+        Ok(Self {
+            request_id: pending.request_id,
+            purpose: pending.purpose.clone(),
+            status: PersistedReviewStatus::Pending,
+            operation,
+        })
+    }
+}
+
+impl TryFrom<PersistedPendingReview> for PendingReview {
+    type Error = String;
+
+    fn try_from(persisted: PersistedPendingReview) -> Result<Self, Self::Error> {
+        let request = match persisted.operation {
+            PersistedReviewOperation::WriteFile { path, content } => {
+                ExecutionRequest::WriteFile(WriteFileArguments { path, content })
+            }
+
+            PersistedReviewOperation::RunCargoTest => ExecutionRequest::RunCargoTest,
+
+            PersistedReviewOperation::HttpPost { url, body } => {
+                ExecutionRequest::HttpRequest(HttpRequestArguments {
+                    method: HttpMethod::Post,
+                    url,
+                    body,
+                })
+            }
+        };
+
+        Ok(PendingReview::new(
+            persisted.request_id,
+            request,
+            persisted.purpose,
+        ))
+    }
+}
+impl PersistedPendingReviewState {
+    const VERSION: u32 = 1;
+}
+
 #[derive(Debug, Default)]
 pub struct PendingReviewStore {
     reviews: HashMap<Uuid, PendingReview>,
+    claimed_reviews: HashMap<Uuid, PendingReview>,
+    persistence_path: Option<PathBuf>,
 }
 
 impl PendingReviewStore {
@@ -30,33 +132,251 @@ impl PendingReviewStore {
         Self::default()
     }
 
+    fn persist(&self) -> Result<(), String> {
+        match &self.persistence_path {
+            Some(path) => self.save_to_path(path),
+            None => Ok(()),
+        }
+    }
+    #[cfg(test)]
+    pub fn get_claimed(&self, request_id: &Uuid) -> Option<&PendingReview> {
+        self.claimed_reviews.get(request_id)
+    }
+    pub fn serialize_state(&self) -> Result<String, String> {
+        let mut reviews = Vec::new();
+
+        for pending in self.reviews.values() {
+            let mut persisted = PersistedPendingReview::try_from(pending)?;
+            persisted.status = PersistedReviewStatus::Pending;
+            reviews.push(persisted);
+        }
+
+        for claimed in self.claimed_reviews.values() {
+            let mut persisted = PersistedPendingReview::try_from(claimed)?;
+            persisted.status = PersistedReviewStatus::Claimed;
+            reviews.push(persisted);
+        }
+
+        let state = PersistedPendingReviewState {
+            version: PersistedPendingReviewState::VERSION,
+            reviews,
+        };
+
+        serde_json::to_string_pretty(&state)
+            .map_err(|error| format!("failed to serialize pending review state: {error}"))
+    }
+    pub fn consume_claimed(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
+        let claimed = self
+            .claimed_reviews
+            .remove(request_id)
+            .ok_or_else(|| "claimed review request not found".to_owned())?;
+
+        if let Err(error) = self.persist() {
+            self.claimed_reviews.insert(*request_id, claimed.clone());
+
+            return Err(format!(
+                "failed to persist consumed claimed review: {error}"
+            ));
+        }
+
+        Ok(claimed)
+    }
+    pub fn from_serialized_state(input: &str) -> Result<Self, String> {
+        let state: PersistedPendingReviewState = serde_json::from_str(input)
+            .map_err(|error| format!("failed to deserialize pending review state: {error}"))?;
+
+        if state.version != PersistedPendingReviewState::VERSION {
+            return Err(format!(
+                "unsupported pending review state version: {}",
+                state.version
+            ));
+        }
+
+        let mut store = Self::new();
+
+        for persisted in state.reviews {
+            let status = persisted.status;
+            let pending = PendingReview::try_from(persisted)?;
+            let request_id = pending.request_id;
+
+            if store.reviews.contains_key(&request_id)
+                || store.claimed_reviews.contains_key(&request_id)
+            {
+                return Err("duplicate pending review request ID in persisted state".to_owned());
+            }
+
+            match status {
+                PersistedReviewStatus::Pending => {
+                    store.reviews.insert(request_id, pending);
+                }
+
+                PersistedReviewStatus::Claimed => {
+                    store.claimed_reviews.insert(request_id, pending);
+                }
+            }
+        }
+
+        Ok(store)
+    }
+    pub fn load_from_path(path: &Path) -> Result<Self, String> {
+        let mut store = match std::fs::read_to_string(path) {
+            Ok(contents) => Self::from_serialized_state(&contents)?,
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::new(),
+
+            Err(error) => {
+                return Err(format!(
+                    "failed to read pending review state file '{}': {error}",
+                    path.display()
+                ));
+            }
+        };
+
+        store.persistence_path = Some(path.to_path_buf());
+
+        Ok(store)
+    }
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let serialized = self.serialize_state()?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
+
+        path.file_name()
+            .ok_or_else(|| "pending review state path must include a file name".to_owned())?;
+
+        let temporary_path = parent.join(format!(".zyguor-pending-reviews-{}.tmp", Uuid::new_v4()));
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let save_result = (|| -> Result<(), String> {
+            let mut temporary_file = options.open(&temporary_path).map_err(|error| {
+                format!("failed to create temporary pending review state file: {error}")
+            })?;
+
+            temporary_file
+                .write_all(serialized.as_bytes())
+                .map_err(|error| format!("failed to write pending review state file: {error}"))?;
+
+            temporary_file
+                .sync_all()
+                .map_err(|error| format!("failed to sync pending review state file: {error}"))?;
+
+            drop(temporary_file);
+
+            std::fs::rename(&temporary_path, path).map_err(|error| {
+                format!("failed to atomically replace pending review state file: {error}")
+            })?;
+
+            Ok(())
+        })();
+
+        if save_result.is_err() {
+            match std::fs::remove_file(&temporary_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+
+        save_result
+    }
+
     pub fn insert(&mut self, pending: PendingReview) -> Result<(), String> {
         if self.reviews.contains_key(&pending.request_id) {
             return Err("pending review request ID already exists".to_owned());
         }
 
-        self.reviews.insert(pending.request_id, pending);
+        let request_id = pending.request_id;
+
+        self.reviews.insert(request_id, pending);
+
+        if let Err(error) = self.persist() {
+            self.reviews.remove(&request_id);
+
+            return Err(format!(
+                "failed to persist pending review insertion: {error}"
+            ));
+        }
+
         Ok(())
     }
+    #[cfg(test)]
+    pub fn take(&mut self, request_id: &Uuid) -> Result<Option<PendingReview>, String> {
+        let removed = self.reviews.remove(request_id);
 
-    pub fn take(&mut self, request_id: &Uuid) -> Option<PendingReview> {
-        self.reviews.remove(request_id)
+        if removed.is_none() {
+            return Ok(None);
+        }
+
+        if let Err(error) = self.persist() {
+            if let Some(pending) = removed.clone() {
+                self.reviews.insert(*request_id, pending);
+            }
+
+            return Err(format!("failed to persist pending review removal: {error}"));
+        }
+
+        Ok(removed)
     }
 
     pub fn get(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.reviews.get(request_id)
     }
+
     pub fn claim(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
-        self.reviews
+        if self.claimed_reviews.contains_key(request_id) {
+            return Err("pending review request is already claimed".to_owned());
+        }
+
+        let pending = self
+            .reviews
             .remove(request_id)
-            .ok_or_else(|| "pending review request not found".to_owned())
+            .ok_or_else(|| "pending review request not found".to_owned())?;
+
+        self.claimed_reviews.insert(*request_id, pending.clone());
+
+        if let Err(error) = self.persist() {
+            self.claimed_reviews.remove(request_id);
+            self.reviews.insert(*request_id, pending);
+
+            return Err(format!("failed to persist pending review claim: {error}"));
+        }
+
+        Ok(pending)
     }
     pub fn restore_claimed(&mut self, pending: PendingReview) -> Result<(), String> {
-        if self.reviews.contains_key(&pending.request_id) {
+        let request_id = pending.request_id;
+
+        if self.reviews.contains_key(&request_id) {
             return Err("pending review request ID already exists".to_owned());
         }
 
-        self.reviews.insert(pending.request_id, pending);
+        let claimed = self
+            .claimed_reviews
+            .remove(&request_id)
+            .ok_or_else(|| "claimed review request not found".to_owned())?;
+
+        if claimed != pending {
+            self.claimed_reviews.insert(request_id, claimed);
+            return Err("claimed review does not match restoration request".to_owned());
+        }
+
+        self.reviews.insert(request_id, pending.clone());
+
+        if let Err(error) = self.persist() {
+            self.reviews.remove(&request_id);
+            self.claimed_reviews.insert(request_id, pending);
+
+            return Err(format!(
+                "failed to persist restored pending review: {error}"
+            ));
+        }
 
         Ok(())
     }
@@ -129,9 +449,8 @@ mod tests {
 
         assert_eq!(
             store.claim(&request_id),
-            Err("pending review request not found".to_owned())
+            Err("pending review request is already claimed".to_owned())
         );
-
         Ok(())
     }
 
@@ -212,13 +531,13 @@ mod tests {
 
         let taken = store.take(&request_id);
 
-        assert_eq!(taken, Some(pending));
+        assert_eq!(taken, Ok(Some(pending)));
         assert!(store.get(&request_id).is_none());
         assert!(store.is_empty());
 
         let second_take = store.take(&request_id);
 
-        assert_eq!(second_take, None);
+        assert_eq!(second_take, Ok(None));
     }
     #[test]
     fn restores_claimed_review_for_safe_retry() -> Result<(), String> {
@@ -282,6 +601,436 @@ mod tests {
         );
         assert_eq!(store.get(&request_id), Some(&original));
         assert_eq!(store.len(), 1);
+
+        Ok(())
+    }
+    #[test]
+    fn serialized_pending_review_state_round_trips() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+        store.insert(pending.clone())?;
+
+        let serialized = store.serialize_state()?;
+        let restored = PendingReviewStore::from_serialized_state(&serialized)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        Ok(())
+    }
+    #[test]
+    fn rejects_unsupported_persisted_state_version() {
+        let input = r#"{
+        "version": 999,
+        "reviews": []
+    }"#;
+
+        let result = PendingReviewStore::from_serialized_state(input);
+
+        let error = result.expect_err("unsupported persisted state version should be rejected");
+
+        assert_eq!(error, "unsupported pending review state version: 999");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn saves_pending_review_state_as_private_file() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-pending-review-save-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        let mut store = PendingReviewStore::new();
+        store.insert(pending.clone())?;
+
+        store.save_to_path(&state_path)?;
+
+        let serialized = fs::read_to_string(&state_path)
+            .map_err(|error| format!("failed to read saved state: {error}"))?;
+
+        let restored = PendingReviewStore::from_serialized_state(&serialized)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        let mode = fs::metadata(&state_path)
+            .map_err(|error| format!("failed to read state metadata: {error}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn missing_pending_review_state_file_loads_empty_store() -> Result<(), String> {
+        let state_path = std::env::temp_dir().join(format!(
+            "zyguor-missing-pending-review-state-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let store = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(store.is_empty());
+
+        Ok(())
+    }
+    #[test]
+    fn corrupt_pending_review_state_is_rejected() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-corrupt-pending-review-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+
+        fs::write(&state_path, "{not-valid-json")
+            .map_err(|error| format!("failed to write corrupt state: {error}"))?;
+
+        let result = PendingReviewStore::load_from_path(&state_path);
+
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn memory_only_store_persist_is_no_op() -> Result<(), String> {
+        let store = PendingReviewStore::new();
+
+        store.persist()?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_insert_is_saved_to_disk() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-insert-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        store.insert(pending.clone())?;
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_claim_moves_review_to_claimed_state() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-claim-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        store.insert(pending.clone())?;
+
+        let claimed = store.claim(&request_id)?;
+
+        assert_eq!(claimed, pending);
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(restored.get(&request_id).is_none());
+        assert_eq!(restored.get_claimed(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_take_removes_review_from_disk() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-take-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        store.insert(pending.clone())?;
+
+        let removed = store.take(&request_id)?;
+
+        assert_eq!(removed, Some(pending));
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(restored.get(&request_id).is_none());
+        assert!(restored.is_empty());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_restore_claimed_is_saved_to_disk() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-restore-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        store.insert(pending.clone())?;
+
+        let claimed = store.claim(&request_id)?;
+
+        assert!(store.get(&request_id).is_none());
+
+        store.restore_claimed(claimed)?;
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn pending_review_survives_store_reload() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-pending-review-reload-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        {
+            let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+            store.insert(PendingReview::new(
+                request_id,
+                ExecutionRequest::WriteFile(WriteFileArguments {
+                    path: "config/settings.txt".to_owned(),
+                    content: "enabled=true".to_owned(),
+                }),
+                "Update application configuration".to_owned(),
+            ))?;
+        }
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = restored
+            .get(&request_id)
+            .ok_or_else(|| "pending review did not survive reload".to_owned())?;
+
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.purpose, "Update application configuration");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_claim_is_not_silently_lost_after_restart() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-claim-restart-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        store.insert(PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        ))?;
+
+        let _claimed = store.claim(&request_id)?;
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(
+            restored.get_claimed(&request_id).is_some(),
+            "claimed review must survive restart as claimed state"
+        );
+
+        assert!(
+            restored.get(&request_id).is_none(),
+            "claimed review must not become normally approvable after restart"
+        );
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persistent_consume_removes_claimed_review_from_disk() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-persistent-consume-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+        );
+
+        store.insert(pending.clone())?;
+        store.claim(&request_id)?;
+
+        assert_eq!(store.get_claimed(&request_id), Some(&pending));
+
+        let consumed = store.consume_claimed(&request_id)?;
+
+        assert_eq!(consumed, pending);
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(restored.get(&request_id).is_none());
+        assert!(restored.get_claimed(&request_id).is_none());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
 
         Ok(())
     }

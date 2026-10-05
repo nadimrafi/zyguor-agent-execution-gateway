@@ -28,10 +28,11 @@ use policy::{
 use sandbox::SandboxExecutor;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use uuid::Uuid;
 
 #[cfg(test)]
 use sandbox::run_infinite_loop_with_fuel;
@@ -365,6 +366,57 @@ where
     serde_json::to_string(&response)
         .map_err(|error| format!("failed to serialize gateway response: {error}"))
 }
+fn validate_pending_review_state_path(
+    workspace_root: &Path,
+    state_path: &Path,
+) -> Result<(), String> {
+    if !state_path.is_absolute() {
+        return Err("ZYGUOR_PENDING_REVIEW_STATE_PATH must be an absolute path".to_owned());
+    }
+
+    let canonical_workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
+        format!(
+            "failed to resolve workspace root '{}': {error}",
+            workspace_root.display()
+        )
+    })?;
+
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
+
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "failed to resolve pending review state parent '{}': {error}",
+            parent.display()
+        )
+    })?;
+
+    let file_name = state_path
+        .file_name()
+        .ok_or_else(|| "pending review state path must include a file name".to_owned())?;
+
+    let candidate = canonical_parent.join(file_name);
+
+    let resolved_state_path = match std::fs::canonicalize(&candidate) {
+        Ok(path) => path,
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => candidate,
+
+        Err(error) => {
+            return Err(format!(
+                "failed to resolve pending review state path '{}': {error}",
+                candidate.display()
+            ));
+        }
+    };
+
+    if resolved_state_path.starts_with(&canonical_workspace) {
+        return Err("pending review state file must be outside the agent workspace".to_owned());
+    }
+
+    Ok(())
+}
 
 fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, String> {
     match params.operation.trim().to_ascii_lowercase().as_str() {
@@ -514,16 +566,14 @@ fn evaluate_request_with_config(
 }
 
 fn reject_pending_request(
-    request_id: uuid::Uuid,
+    request_id: Uuid,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
 ) -> Result<PendingReview, String> {
     let mut store = pending_reviews
         .lock()
         .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-    store
-        .take(&request_id)
-        .ok_or_else(|| "pending review request not found".to_owned())
+    store.claim(&request_id)
 }
 fn inspect_pending_request(
     request_id: uuid::Uuid,
@@ -547,6 +597,16 @@ fn restore_claimed_request(
         .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
     store.restore_claimed(pending)
+}
+fn consume_claimed_request(
+    request_id: Uuid,
+    pending_reviews: &Arc<Mutex<PendingReviewStore>>,
+) -> Result<PendingReview, String> {
+    let mut store = pending_reviews
+        .lock()
+        .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+    store.consume_claimed(&request_id)
 }
 fn review_reason_for_request(request: &ExecutionRequest) -> Result<PolicyReason, String> {
     match request {
@@ -638,6 +698,10 @@ where
 
         return Err(audit_error);
     }
+
+    consume_claimed_request(claimed.request_id, pending_reviews).map_err(|consume_error| {
+        format!("rejection audit succeeded but failed to consume claimed request: {consume_error}")
+    })?;
 
     Ok(())
 }
@@ -819,7 +883,18 @@ where
     W: FnOnce() -> Result<ReviewedOperationResult, String>,
 {
     match execute_reviewed_action(claimed, audit_writer, operation) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => {
+            consume_claimed_request(claimed.request_id, pending_reviews).map_err(
+                |consume_error| {
+                    format!(
+                        "reviewed operation completed but failed to consume claimed request: \
+                     {consume_error}"
+                    )
+                },
+            )?;
+
+            Ok(outcome)
+        }
 
         Err(execution_error) => {
             restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
@@ -841,7 +916,19 @@ where
     W: FnOnce() -> Result<(), String>,
 {
     match execute_approved_write(claimed, audit_writer, write_operation) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => {
+            consume_claimed_request(claimed.request_id, pending_reviews).map_err(
+                |consume_error| {
+                    format!(
+                        "reviewed write completed but failed to consume claimed request: \
+                     {consume_error}"
+                    )
+                },
+            )?;
+
+            Ok(outcome)
+        }
+
         Err(execution_error) => {
             restore_claimed_request(claimed.clone(), pending_reviews).map_err(|restore_error| {
                 format!("{execution_error}; failed to restore claimed request: {restore_error}")
@@ -1266,7 +1353,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let admin_listener = create_admin_listener(Path::new(&admin_socket_path)).await?;
 
-    let pending_reviews = Arc::new(Mutex::new(PendingReviewStore::new()));
+    let pending_review_state_path = std::env::var("ZYGUOR_PENDING_REVIEW_STATE_PATH")
+    .map(PathBuf::from)
+    .map_err(|_| {
+        "ZYGUOR_PENDING_REVIEW_STATE_PATH must be set to an operational state file outside the agent workspace"
+            .to_owned()
+    })?;
+    validate_pending_review_state_path(Path::new(&workspace_root), &pending_review_state_path)?;
+
+    let pending_review_store = PendingReviewStore::load_from_path(&pending_review_state_path)
+        .map_err(|error| format!("failed to load pending review state: {error}"))?;
+
+    let pending_reviews = Arc::new(Mutex::new(pending_review_store));
 
     let filesystem = FileSystemCapability::try_new(workspace_root.into())?;
 
@@ -4629,6 +4727,64 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace)
             .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn pending_review_state_path_outside_workspace_is_allowed() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-review-state-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let operational_dir = test_root.join("operational-state");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&operational_dir)
+            .map_err(|error| format!("failed to create operational directory: {error}"))?;
+
+        let state_path = operational_dir.join("pending-reviews.json");
+
+        let result = super::validate_pending_review_state_path(&workspace, &state_path);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(result, Ok(()));
+
+        Ok(())
+    }
+    #[test]
+    fn pending_review_state_path_inside_workspace_is_rejected() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-review-state-inside-workspace-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let state_dir = workspace.join("operational-state");
+
+        fs::create_dir_all(&state_dir)
+            .map_err(|error| format!("failed to create test directories: {error}"))?;
+
+        let state_path = state_dir.join("pending-reviews.json");
+
+        let result = super::validate_pending_review_state_path(&workspace, &state_path);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert_eq!(
+            result,
+            Err("pending review state file must be outside the agent workspace".to_owned())
+        );
 
         Ok(())
     }
