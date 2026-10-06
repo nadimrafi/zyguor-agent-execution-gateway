@@ -28,6 +28,7 @@ use policy::{
 use sandbox::SandboxExecutor;
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1224,6 +1225,48 @@ impl ZyguorGateway {
         }
     }
 }
+#[derive(Debug)]
+struct AdminSocketPathGuard {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl AdminSocketPathGuard {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect owned admin socket: {error}"))?;
+
+        if !metadata.file_type().is_socket() {
+            return Err("admin socket guard requires an existing Unix socket".to_owned());
+        }
+
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+impl Drop for AdminSocketPathGuard {
+    fn drop(&mut self) {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.dev() == self.device
+                    && metadata.ino() == self.inode =>
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+
+            Ok(_) => {}
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+
+            Err(_) => {}
+        }
+    }
+}
 
 async fn create_admin_listener(socket_path: &Path) -> Result<UnixListener, String> {
     if socket_path.exists() {
@@ -1308,6 +1351,34 @@ async fn handle_admin_connection(
         }
     }
 }
+async fn create_managed_admin_listener(
+    socket_path: &Path,
+) -> Result<(UnixListener, AdminSocketPathGuard), String> {
+    let listener = create_admin_listener(socket_path).await?;
+
+    match AdminSocketPathGuard::new(socket_path.to_path_buf()) {
+        Ok(guard) => Ok((listener, guard)),
+
+        Err(error) => {
+            drop(listener);
+
+            match std::fs::remove_file(socket_path) {
+                Ok(()) => {}
+
+                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+
+                Err(cleanup_error) => {
+                    return Err(format!(
+                        "{error}; failed to clean up admin socket after ownership setup failure: \
+                         {cleanup_error}"
+                    ));
+                }
+            }
+
+            Err(error)
+        }
+    }
+}
 async fn run_admin_listener(
     listener: UnixListener,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
@@ -1325,6 +1396,23 @@ async fn run_admin_listener(
         {
             eprintln!("admin command rejected: {error}");
         }
+    }
+}
+async fn stop_admin_task(
+    admin_task: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    if !admin_task.is_finished() {
+        admin_task.abort();
+    }
+
+    match admin_task.await {
+        Err(error) if error.is_cancelled() => Ok(()),
+
+        Ok(Ok(())) => Ok(()),
+
+        Ok(Err(error)) => Err(format!("admin listener failed: {error}")),
+
+        Err(error) => Err(format!("admin listener task failed: {error}")),
     }
 }
 
@@ -1351,7 +1439,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Arc::new(config);
 
-    let admin_listener = create_admin_listener(Path::new(&admin_socket_path)).await?;
+    let (admin_listener, admin_socket_guard) =
+        create_managed_admin_listener(Path::new(&admin_socket_path))
+            .await
+            .map_err(|error| format!("failed to initialize admin socket: {error}"))?;
 
     let pending_review_state_path = std::env::var("ZYGUOR_PENDING_REVIEW_STATE_PATH")
     .map(PathBuf::from)
@@ -1381,13 +1472,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&config),
     ));
 
-    let service = gateway.serve(stdio()).await?;
+    let gateway_result = async {
+        let service = gateway.serve(stdio()).await?;
 
-    service.waiting().await?;
+        service.waiting().await?;
 
-    admin_task.abort();
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
 
-    Ok(())
+    let admin_shutdown_result = stop_admin_task(admin_task).await;
+
+    if let Err(error) = admin_shutdown_result {
+        if gateway_result.is_ok() {
+            return Err(error.into());
+        }
+
+        eprintln!("admin listener failed during gateway shutdown: {error}");
+    }
+
+    drop(admin_socket_guard);
+
+    gateway_result
 }
 #[cfg(test)]
 fn evaluate_request(
@@ -1432,21 +1538,23 @@ fn execute_request(
 mod gateway_tests {
     use super::ExecutionResult;
     use super::{
-        AddArguments, AdminCommand, AdminOutcome, AuditPhase, ExecuteParams,
+        AddArguments, AdminCommand, AdminOutcome, AdminSocketPathGuard, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
         FileSystemCapability, GatewayConfig, HttpExecutionResult, HttpMethod,
         MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation,
         PolicyReason, ReadFileArguments, ReviewedExecutionOutcome, ReviewedOperationResult,
         WriteFileArguments, audit_claimed_approval, build_execution_request, create_admin_listener,
-        evaluate_request, evaluate_request_with_config, execute_http_post_with_config,
-        execute_message_with_audit_id, execute_request, execute_request_with_http_runner,
-        handle_admin_command, handle_admin_command_with_http_runner, handle_admin_connection,
-        parse_admin_command, reject_pending_request, revalidate_pending_request,
-        review_reason_for_request, run_infinite_loop_with_fuel,
+        create_managed_admin_listener, evaluate_request, evaluate_request_with_config,
+        execute_http_post_with_config, execute_message_with_audit_id, execute_request,
+        execute_request_with_http_runner, handle_admin_command,
+        handle_admin_command_with_http_runner, handle_admin_connection, parse_admin_command,
+        reject_pending_request, revalidate_pending_request, review_reason_for_request,
+        run_infinite_loop_with_fuel, stop_admin_task,
     };
     use crate::execution::HttpRequestArguments;
     use crate::pending_review::{PendingReview, PendingReviewStore};
     use crate::policy::evaluate_message;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
@@ -2359,6 +2467,119 @@ mod tests {
 
         std::fs::remove_file(&socket_path)
             .map_err(|error| format!("failed to remove test path: {error}"))?;
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_socket_guard_removes_owned_socket_on_drop() -> Result<(), String> {
+        let socket_path =
+            PathBuf::from("/tmp").join(format!("zg-{}.sock", uuid::Uuid::new_v4().simple()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+
+        let guard = AdminSocketPathGuard::new(socket_path.clone())?;
+
+        assert!(socket_path.exists());
+
+        drop(listener);
+        drop(guard);
+
+        assert!(
+            !socket_path.exists(),
+            "admin socket path should be removed when its lifecycle guard is dropped"
+        );
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .map_err(|error| format!("failed to clean up test admin socket: {error}"))?;
+        }
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_socket_guard_does_not_remove_replacement_socket() -> Result<(), String> {
+        use std::path::PathBuf;
+
+        let socket_path =
+            PathBuf::from("/tmp").join(format!("zg-{}.sock", uuid::Uuid::new_v4().simple()));
+
+        let original_listener = create_admin_listener(&socket_path).await?;
+        let guard = AdminSocketPathGuard::new(socket_path.clone())?;
+
+        drop(original_listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove original admin socket: {error}"))?;
+
+        let replacement_listener = tokio::net::UnixListener::bind(&socket_path)
+            .map_err(|error| format!("failed to create replacement admin socket: {error}"))?;
+
+        assert!(socket_path.exists());
+
+        drop(guard);
+
+        assert!(
+            socket_path.exists(),
+            "admin socket guard must not remove a replacement socket it does not own"
+        );
+
+        drop(replacement_listener);
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .map_err(|error| format!("failed to clean up replacement admin socket: {error}"))?;
+        }
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_socket_is_cleaned_up_after_later_startup_failure() -> Result<(), String> {
+        use std::path::PathBuf;
+
+        let socket_path =
+            PathBuf::from("/tmp").join(format!("zg-{}.sock", uuid::Uuid::new_v4().simple()));
+
+        let startup_result: Result<(), String> = async {
+            let _listener = create_admin_listener(&socket_path).await?;
+
+            let _guard = AdminSocketPathGuard::new(socket_path.clone())?;
+
+            assert!(socket_path.exists());
+
+            Err("simulated later startup failure".to_owned())
+        }
+        .await;
+
+        assert_eq!(
+            startup_result,
+            Err("simulated later startup failure".to_owned())
+        );
+
+        assert!(
+            !socket_path.exists(),
+            "admin socket path must be cleaned up when startup fails after socket creation"
+        );
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn managed_admin_listener_returns_guarded_socket() -> Result<(), String> {
+        use std::path::PathBuf;
+
+        let socket_path =
+            PathBuf::from("/tmp").join(format!("zg-{}.sock", uuid::Uuid::new_v4().simple()));
+
+        let (listener, guard) = create_managed_admin_listener(&socket_path).await?;
+
+        assert!(socket_path.exists());
+
+        drop(listener);
+        drop(guard);
+
+        assert!(
+            !socket_path.exists(),
+            "managed admin listener must clean up its owned socket path"
+        );
 
         Ok(())
     }
@@ -4787,5 +5008,92 @@ mod tests {
         );
 
         Ok(())
+    }
+    #[tokio::test]
+    async fn stop_admin_task_waits_for_task_termination() -> Result<(), String> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct DropMarker {
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker {
+                dropped: task_dropped,
+            };
+
+            ready_tx
+                .send(())
+                .map_err(|_| "failed to signal admin task readiness".to_owned())?;
+
+            std::future::pending::<()>().await;
+
+            Ok::<(), String>(())
+        });
+
+        ready_rx
+            .await
+            .map_err(|_| "admin task did not signal readiness".to_owned())?;
+
+        stop_admin_task(task).await?;
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "admin task must be fully terminated before shutdown helper returns"
+        );
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn stop_admin_task_reports_listener_failure() {
+        let task = tokio::spawn(async {
+            Err::<(), String>("simulated admin listener failure".to_owned())
+        });
+
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let result = stop_admin_task(task).await;
+
+        assert_eq!(
+            result,
+            Err("admin listener failed: simulated admin listener failure".to_owned())
+        );
+    }
+    #[tokio::test]
+    async fn stop_admin_task_reports_task_panic() {
+        async fn panicking_admin_task() -> Result<(), String> {
+            panic!("simulated admin task panic");
+        }
+
+        let task = tokio::spawn(panicking_admin_task());
+
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let result = stop_admin_task(task).await;
+
+        let error = result.expect_err("panicked admin task should be reported");
+
+        assert!(
+            error.starts_with("admin listener task failed:"),
+            "unexpected error: {error}"
+        );
     }
 }
