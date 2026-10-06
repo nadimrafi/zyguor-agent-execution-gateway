@@ -10,6 +10,7 @@ mod pending_review;
 mod policy;
 mod sandbox;
 mod workspace_fingerprint;
+mod workspace_snapshot;
 use workspace_fingerprint::compute_workspace_fingerprint;
 
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
@@ -752,9 +753,10 @@ where
 fn execute_cargo_test_with_config(
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
+    expected_fingerprint: &str,
 ) -> Result<ReviewedOperationResult, String> {
     let executor = CargoTestExecutor::new(config.cargo_test);
-    let result = executor.run(filesystem.workspace_root())?;
+    let result = executor.run(filesystem.workspace_root(), expected_fingerprint)?;
 
     let execution_result = ExecutionResult::CargoTest {
         result: result.clone(),
@@ -1022,11 +1024,15 @@ where
                 }
 
                 ExecutionRequest::RunCargoTest => {
+                    let expected_fingerprint =
+                        claimed.workspace_fingerprint.as_deref().ok_or_else(|| {
+                            "approved Cargo test review is missing workspace fingerprint".to_owned()
+                        })?;
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
                         persist_audit,
-                        || execute_cargo_test_with_config(filesystem, config),
+                        || execute_cargo_test_with_config(filesystem, config, expected_fingerprint),
                     )?;
 
                     match outcome {
