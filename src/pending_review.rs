@@ -18,6 +18,7 @@ pub struct PendingReview {
     pub request_id: Uuid,
     pub request: ExecutionRequest,
     pub purpose: String,
+    pub workspace_fingerprint: Option<String>,
 }
 
 impl PendingReview {
@@ -26,6 +27,21 @@ impl PendingReview {
             request_id,
             request,
             purpose,
+            workspace_fingerprint: None,
+        }
+    }
+
+    pub fn new_with_workspace_fingerprint(
+        request_id: Uuid,
+        request: ExecutionRequest,
+        purpose: String,
+        workspace_fingerprint: String,
+    ) -> Self {
+        Self {
+            request_id,
+            request,
+            purpose,
+            workspace_fingerprint: Some(workspace_fingerprint),
         }
     }
 }
@@ -53,7 +69,7 @@ enum PersistedReviewStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PersistedReviewOperation {
     WriteFile { path: String, content: String },
-    RunCargoTest,
+    RunCargoTest { workspace_fingerprint: String },
     HttpPost { url: String, body: Option<String> },
 }
 impl TryFrom<&PendingReview> for PersistedPendingReview {
@@ -66,7 +82,16 @@ impl TryFrom<&PendingReview> for PersistedPendingReview {
                 content: arguments.content.clone(),
             },
 
-            ExecutionRequest::RunCargoTest => PersistedReviewOperation::RunCargoTest,
+            ExecutionRequest::RunCargoTest => {
+                let workspace_fingerprint =
+                    pending.workspace_fingerprint.clone().ok_or_else(|| {
+                        "Cargo test pending review is missing workspace fingerprint".to_owned()
+                    })?;
+
+                PersistedReviewOperation::RunCargoTest {
+                    workspace_fingerprint,
+                }
+            }
 
             ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
                 PersistedReviewOperation::HttpPost {
@@ -98,7 +123,16 @@ impl TryFrom<PersistedPendingReview> for PendingReview {
                 ExecutionRequest::WriteFile(WriteFileArguments { path, content })
             }
 
-            PersistedReviewOperation::RunCargoTest => ExecutionRequest::RunCargoTest,
+            PersistedReviewOperation::RunCargoTest {
+                workspace_fingerprint,
+            } => {
+                return Ok(PendingReview::new_with_workspace_fingerprint(
+                    persisted.request_id,
+                    ExecutionRequest::RunCargoTest,
+                    persisted.purpose,
+                    workspace_fingerprint,
+                ));
+            }
 
             PersistedReviewOperation::HttpPost { url, body } => {
                 ExecutionRequest::HttpRequest(HttpRequestArguments {
@@ -117,7 +151,7 @@ impl TryFrom<PersistedPendingReview> for PendingReview {
     }
 }
 impl PersistedPendingReviewState {
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
 }
 
 #[derive(Debug, Default)]

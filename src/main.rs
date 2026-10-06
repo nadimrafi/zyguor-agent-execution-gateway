@@ -9,6 +9,9 @@ mod http_execution;
 mod pending_review;
 mod policy;
 mod sandbox;
+mod workspace_fingerprint;
+use workspace_fingerprint::compute_workspace_fingerprint;
+
 use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
 use cargo_test::{CargoTestExecutor, CargoTestResult};
 use config::{GatewayConfig, resolve_gateway_config};
@@ -632,10 +635,31 @@ fn revalidate_pending_request_with_config(
             .revalidate_write_target(&arguments.path)
             .map_err(|error| format!("pending write target is no longer valid: {error}")),
 
-        ExecutionRequest::RunCargoTest => filesystem
-            .resolve_existing_path("Cargo.toml")
-            .map(|_| ())
-            .map_err(|error| format!("pending Cargo test workspace is no longer valid: {error}")),
+        ExecutionRequest::RunCargoTest => {
+            filesystem
+                .resolve_existing_path("Cargo.toml")
+                .map_err(|error| {
+                    format!("pending Cargo test workspace is no longer valid: {error}")
+                })?;
+
+            let expected_fingerprint =
+                pending.workspace_fingerprint.as_deref().ok_or_else(|| {
+                    "pending Cargo test review is missing workspace fingerprint".to_owned()
+                })?;
+
+            let current_fingerprint = compute_workspace_fingerprint(filesystem.workspace_root())
+                .map_err(|error| {
+                    format!(
+                        "pending Cargo test workspace fingerprint could not be verified: {error}"
+                    )
+                })?;
+
+            if current_fingerprint != expected_fingerprint {
+                return Err("pending Cargo test workspace changed after review".to_owned());
+            }
+
+            Ok(())
+        }
 
         ExecutionRequest::HttpRequest(arguments) if arguments.method == HttpMethod::Post => {
             validate_http_destination(&arguments.url, &config.http.allowed_hosts)
@@ -1130,8 +1154,25 @@ where
     let request_id = uuid::Uuid::new_v4();
 
     if evaluation.decision == PolicyDecision::Review {
-        let pending =
-            PendingReview::new(request_id, request.clone(), params.context.purpose.clone());
+        let pending = match &request {
+            ExecutionRequest::RunCargoTest => {
+                let workspace_fingerprint = compute_workspace_fingerprint(
+                    filesystem.workspace_root(),
+                )
+                .map_err(|error| {
+                    format!("failed to fingerprint pending Cargo test workspace: {error}")
+                })?;
+
+                PendingReview::new_with_workspace_fingerprint(
+                    request_id,
+                    request.clone(),
+                    params.context.purpose.clone(),
+                    workspace_fingerprint,
+                )
+            }
+
+            _ => PendingReview::new(request_id, request.clone(), params.context.purpose.clone()),
+        };
 
         let mut store = pending_reviews
             .lock()
@@ -2250,11 +2291,17 @@ mod tests {
                 .lock()
                 .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-            store.insert(crate::pending_review::PendingReview::new(
-                request_id,
-                ExecutionRequest::RunCargoTest,
-                "Test failed Cargo execution".to_owned(),
-            ))?;
+            let workspace_fingerprint =
+                crate::workspace_fingerprint::compute_workspace_fingerprint(&workspace)?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_workspace_fingerprint(
+                    request_id,
+                    ExecutionRequest::RunCargoTest,
+                    "Test failed Cargo execution".to_owned(),
+                    workspace_fingerprint,
+                ),
+            )?;
         }
 
         let filesystem = FileSystemCapability::try_new(workspace.clone())?;
@@ -2343,6 +2390,120 @@ mod tests {
 
         assert!(store.get(&request_id).is_some());
         assert_eq!(store.len(), 1);
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove Cargo test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn cargo_test_approval_rejects_changed_workspace_after_review() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-cargo-fingerprint-change-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        let src_directory = workspace.join("src");
+
+        std::fs::create_dir_all(&src_directory)
+            .map_err(|error| format!("failed to create Cargo test workspace: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            r#"[package]
+name = "zyguor-cargo-fingerprint-change-fixture"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.toml: {error}"))?;
+
+        std::fs::write(
+            workspace.join("Cargo.lock"),
+            r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "zyguor-cargo-fingerprint-change-fixture"
+version = "0.1.0"
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo.lock: {error}"))?;
+
+        let source_path = src_directory.join("lib.rs");
+
+        std::fs::write(
+            &source_path,
+            r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_passes() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+"#,
+        )
+        .map_err(|error| format!("failed to write Cargo test source: {error}"))?;
+
+        let workspace_fingerprint =
+            crate::workspace_fingerprint::compute_workspace_fingerprint(&workspace)?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_workspace_fingerprint(
+                    request_id,
+                    ExecutionRequest::RunCargoTest,
+                    "Test changed Cargo workspace rejection".to_owned(),
+                    workspace_fingerprint,
+                ),
+            )?;
+        }
+
+        std::fs::write(
+            &source_path,
+            r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_passes() {
+        assert_eq!(3 + 3, 6);
+    }
+}
+"#,
+        )
+        .map_err(|error| format!("failed to modify Cargo test source: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("changed Cargo workspace approval should fail");
+
+        assert!(
+            error.contains("pending Cargo test workspace changed after review"),
+            "unexpected error: {error}"
+        );
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
 
         drop(store);
 
@@ -4150,11 +4311,17 @@ mod tests {
                 .lock()
                 .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-            store.insert(crate::pending_review::PendingReview::new(
-                request_id,
-                ExecutionRequest::RunCargoTest,
-                "Test approved Cargo execution".to_owned(),
-            ))?;
+            let workspace_fingerprint =
+                crate::workspace_fingerprint::compute_workspace_fingerprint(&workspace)?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_workspace_fingerprint(
+                    request_id,
+                    ExecutionRequest::RunCargoTest,
+                    "Test approved Cargo execution".to_owned(),
+                    workspace_fingerprint,
+                ),
+            )?;
         }
 
         let filesystem = FileSystemCapability::try_new(workspace.clone())?;
