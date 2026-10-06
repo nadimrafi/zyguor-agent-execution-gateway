@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 use std::{
@@ -57,6 +58,22 @@ fn terminate_process_group(process_id: u32) -> Result<(), String> {
 
     Err(format!("failed to terminate cargo process group: {error}"))
 }
+#[cfg(test)]
+fn process_group_id(process_id: u32) -> Result<i32, String> {
+    let pid = i32::try_from(process_id)
+        .map_err(|_| "cargo process ID does not fit in pid_t".to_owned())?;
+
+    let process_group = unsafe { libc::getpgid(pid) };
+
+    if process_group == -1 {
+        return Err(format!(
+            "failed to inspect cargo process group: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(process_group)
+}
 fn create_capture_file(label: &str) -> Result<(PathBuf, File), String> {
     let path = std::env::temp_dir().join(format!(
         "zyguor-cargo-{label}-{}-{}.log",
@@ -93,6 +110,28 @@ fn remove_capture_file(path: &Path) -> Result<(), String> {
         )),
     }
 }
+fn configure_cargo_environment(command: &mut Command) {
+    configure_cargo_environment_from(command, std::env::vars_os());
+}
+
+fn configure_cargo_environment_from<I>(command: &mut Command, environment: I)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    const ALLOWED_ENVIRONMENT: &[&str] = &["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR"];
+
+    command.env_clear();
+
+    for (name, value) in environment {
+        let allowed = ALLOWED_ENVIRONMENT
+            .iter()
+            .any(|allowed_name| name.as_os_str() == OsStr::new(allowed_name));
+
+        if allowed {
+            command.env(name, value);
+        }
+    }
+}
 pub struct CargoTestExecutor {
     config: CargoTestConfig,
 }
@@ -116,7 +155,9 @@ impl CargoTestExecutor {
             }
         };
 
-        let spawn_result = Command::new("cargo")
+        let mut command = Command::new("cargo");
+
+        command
             .arg("test")
             .arg("--locked")
             .arg("--offline")
@@ -124,8 +165,11 @@ impl CargoTestExecutor {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
-            .process_group(0)
-            .spawn();
+            .process_group(0);
+
+        configure_cargo_environment(&mut command);
+
+        let spawn_result = command.spawn();
 
         let mut child = match spawn_result {
             Ok(child) => child,
@@ -246,7 +290,11 @@ fn read_bounded<R: Read>(mut reader: R, maximum_bytes: usize) -> Result<(String,
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CargoTestConfig, CargoTestExecutor, read_bounded};
+    use super::{
+        CargoTestConfig, CargoTestExecutor, configure_cargo_environment_from, process_group_id,
+        read_bounded, terminate_process_group,
+    };
+    use std::process::Command;
 
     #[test]
     fn bounded_reader_preserves_output_within_limit() -> Result<(), String> {
@@ -457,6 +505,70 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace)
             .map_err(|error| format!("failed to remove descendant test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn cargo_environment_filters_unapproved_variables() -> Result<(), String> {
+        use std::ffi::OsString;
+
+        let mut command = Command::new("/usr/bin/env");
+
+        configure_cargo_environment_from(
+            &mut command,
+            vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (OsString::from("HOME"), OsString::from("/tmp/zyguor-home")),
+                (
+                    OsString::from("ZYGUOR_TEST_SECRET"),
+                    OsString::from("must-not-leak"),
+                ),
+                (
+                    OsString::from("UNRELATED_API_TOKEN"),
+                    OsString::from("also-must-not-leak"),
+                ),
+            ],
+        );
+
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to inspect filtered Cargo environment: {error}"))?;
+
+        let environment = String::from_utf8_lossy(&output.stdout);
+
+        assert!(environment.contains("PATH=/usr/bin:/bin"));
+        assert!(environment.contains("HOME=/tmp/zyguor-home"));
+
+        assert!(!environment.contains("ZYGUOR_TEST_SECRET"));
+        assert!(!environment.contains("UNRELATED_API_TOKEN"));
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn spawned_process_group_identity_matches_group_leader() -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("failed to spawn process-group fixture: {error}"))?;
+
+        let process_id = child.id();
+
+        let process_group = process_group_id(process_id)?;
+
+        assert_eq!(
+            process_group,
+            i32::try_from(process_id).map_err(|_| "fixture PID does not fit in pid_t".to_owned())?
+        );
+
+        terminate_process_group(process_id)?;
+
+        child
+            .wait()
+            .map_err(|error| format!("failed to wait for process-group fixture: {error}"))?;
 
         Ok(())
     }
