@@ -632,9 +632,28 @@ fn revalidate_pending_request_with_config(
     config: &GatewayConfig,
 ) -> Result<(), String> {
     match &pending.request {
-        ExecutionRequest::WriteFile(arguments) => filesystem
-            .revalidate_write_target(&arguments.path)
-            .map_err(|error| format!("pending write target is no longer valid: {error}")),
+        ExecutionRequest::WriteFile(arguments) => {
+            filesystem
+                .revalidate_write_target(&arguments.path)
+                .map_err(|error| format!("pending write target is no longer valid: {error}"))?;
+
+            let expected_state = pending
+                .write_target_state
+                .as_ref()
+                .ok_or_else(|| "pending write review is missing target state".to_owned())?;
+
+            let current_state = filesystem
+                .capture_write_target_state(&arguments.path)
+                .map_err(|error| {
+                    format!("pending write target state could not be verified: {error}")
+                })?;
+
+            if &current_state != expected_state {
+                return Err("pending write target changed after review".to_owned());
+            }
+
+            Ok(())
+        }
 
         ExecutionRequest::RunCargoTest => {
             filesystem
@@ -1028,6 +1047,7 @@ where
                         claimed.workspace_fingerprint.as_deref().ok_or_else(|| {
                             "approved Cargo test review is missing workspace fingerprint".to_owned()
                         })?;
+
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
@@ -1174,6 +1194,21 @@ where
                     request.clone(),
                     params.context.purpose.clone(),
                     workspace_fingerprint,
+                )
+            }
+
+            ExecutionRequest::WriteFile(arguments) => {
+                let write_target_state = filesystem
+                    .capture_write_target_state(&arguments.path)
+                    .map_err(|error| {
+                        format!("failed to capture pending write target state: {error}")
+                    })?;
+
+                PendingReview::new_with_write_target_state(
+                    request_id,
+                    request.clone(),
+                    params.context.purpose.clone(),
+                    write_target_state,
                 )
             }
 
@@ -1787,18 +1822,23 @@ mod gateway_tests {
         let listener = create_admin_listener(&socket_path).await?;
         let pending_reviews = empty_pending_review_store();
 
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let write_target_state = filesystem.capture_write_target_state("approved.txt")?;
+
         {
             let mut store = pending_reviews
                 .lock()
                 .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-            store.insert(PendingReview::new(
+            store.insert(PendingReview::new_with_write_target_state(
                 request_id,
                 ExecutionRequest::WriteFile(WriteFileArguments {
                     path: "approved.txt".to_owned(),
                     content: "approved content".to_owned(),
                 }),
                 "Test admin approval response".to_owned(),
+                write_target_state,
             ))?;
         }
 
@@ -1830,8 +1870,6 @@ mod gateway_tests {
             .accept()
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
-
-        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
 
         let config = GatewayConfig::default();
         let outcome =
@@ -1928,6 +1966,82 @@ mod gateway_tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Review);
         assert_eq!(evaluation.reason, PolicyReason::ExternalWrite);
+    }
+    #[test]
+    fn write_approval_rejects_target_changed_after_review() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-write-target-change-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let target = workspace.join("config.txt");
+
+        std::fs::write(&target, "version-a")
+            .map_err(|error| format!("failed to create initial target: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let write_target_state = filesystem.capture_write_target_state("config.txt")?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_write_target_state(
+                    request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments {
+                        path: "config.txt".to_owned(),
+                        content: "approved replacement".to_owned(),
+                    }),
+                    "Test changed write target rejection".to_owned(),
+                    write_target_state,
+                ),
+            )?;
+        }
+
+        std::fs::write(&target, "version-b")
+            .map_err(|error| format!("failed to modify target after review: {error}"))?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("changed write target approval should fail");
+
+        assert!(
+            error.contains("pending write target changed after review"),
+            "unexpected error: {error}"
+        );
+
+        let current_content = std::fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read changed target: {error}"))?;
+
+        assert_eq!(current_content, "version-b");
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
     }
 
     #[test]
@@ -2524,21 +2638,6 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let pending_reviews = empty_pending_review_store();
 
-        {
-            let mut store = pending_reviews
-                .lock()
-                .map_err(|_| "pending review store lock poisoned".to_owned())?;
-
-            store.insert(crate::pending_review::PendingReview::new(
-                request_id,
-                ExecutionRequest::WriteFile(WriteFileArguments {
-                    path: "config/settings.txt".to_owned(),
-                    content: "enabled=true".to_owned(),
-                }),
-                "Update application configuration".to_owned(),
-            ))?;
-        }
-
         let workspace =
             std::env::temp_dir().join(format!("zyguor-approval-claim-test-{request_id}"));
 
@@ -2548,6 +2647,26 @@ mod tests {
             .map_err(|error| format!("failed to create test workspace: {error}"))?;
 
         let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let write_target_state = filesystem.capture_write_target_state("config/settings.txt")?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_write_target_state(
+                    request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments {
+                        path: "config/settings.txt".to_owned(),
+                        content: "enabled=true".to_owned(),
+                    }),
+                    "Update application configuration".to_owned(),
+                    write_target_state,
+                ),
+            )?;
+        }
 
         let result = handle_admin_command(
             AdminCommand::Approve { request_id },
@@ -3384,7 +3503,7 @@ mod tests {
         fs::create_dir_all(&workspace)
             .map_err(|error| format!("failed to create workspace: {error}"))?;
 
-        let filesystem = FileSystemCapability::new(workspace);
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
 
         let params = ExecuteParams {
             operation: "write_file".to_owned(),
@@ -4217,23 +4336,26 @@ mod tests {
             .map_err(|error| format!("failed to create test workspace: {error}"))?;
 
         let target = workspace.join("approved.txt");
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+        let write_target_state = filesystem.capture_write_target_state("approved.txt")?;
 
         {
             let mut store = pending_reviews
                 .lock()
                 .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
-            store.insert(crate::pending_review::PendingReview::new(
-                request_id,
-                ExecutionRequest::WriteFile(WriteFileArguments {
-                    path: "approved.txt".to_owned(),
-                    content: "approved content".to_owned(),
-                }),
-                "Test valid approval execution".to_owned(),
-            ))?;
+            store.insert(
+                crate::pending_review::PendingReview::new_with_write_target_state(
+                    request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments {
+                        path: "approved.txt".to_owned(),
+                        content: "approved content".to_owned(),
+                    }),
+                    "Test valid approval execution".to_owned(),
+                    write_target_state,
+                ),
+            )?;
         }
-
-        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
 
         let result = handle_admin_command(
             AdminCommand::Approve { request_id },

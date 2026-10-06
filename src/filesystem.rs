@@ -1,6 +1,7 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -8,6 +9,12 @@ use std::sync::Arc;
 
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WriteTargetState {
+    Missing,
+    Existing { sha256: String },
+}
 
 #[derive(Debug, Clone)]
 pub struct FileSystemCapability {
@@ -171,6 +178,70 @@ impl FileSystemCapability {
 
         Ok(())
     }
+    pub fn capture_write_target_state(
+        &self,
+        requested_path: &str,
+    ) -> Result<WriteTargetState, String> {
+        self.revalidate_write_target(requested_path)?;
+
+        let relative_path = Path::new(requested_path);
+
+        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
+            "write target state capture requires an anchored workspace capability".to_owned()
+        })?;
+
+        match workspace.symlink_metadata(relative_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err("write target must not be a symbolic link".to_owned());
+                }
+
+                if !metadata.is_file() {
+                    return Err("write target must be a regular file".to_owned());
+                }
+            }
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WriteTargetState::Missing);
+            }
+
+            Err(error) => {
+                return Err(format!("failed to inspect write target state: {error}"));
+            }
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+
+        let mut file = workspace
+            .open_with(relative_path, &options)
+            .map_err(|error| format!("failed to open write target for fingerprinting: {error}"))?;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 8192];
+
+        loop {
+            let bytes_read = file.read(&mut buffer).map_err(|error| {
+                format!("failed to read write target for fingerprinting: {error}")
+            })?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        let digest = hasher.finalize();
+
+        let sha256 = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        Ok(WriteTargetState::Existing { sha256 })
+    }
 
     pub fn write_text_file(&self, requested_path: &str, content: &str) -> Result<(), String> {
         if content.len() > MAX_WRITE_BYTES {
@@ -297,7 +368,7 @@ impl FileSystemCapability {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSystemCapability, MAX_READ_BYTES, MAX_WRITE_BYTES};
+    use super::{FileSystemCapability, MAX_READ_BYTES, MAX_WRITE_BYTES, WriteTargetState};
     use std::path::PathBuf;
 
     #[test]
@@ -1320,6 +1391,59 @@ mod tests {
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn captures_missing_write_target_state() -> Result<(), String> {
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-write-state-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let state = filesystem.capture_write_target_state("new-file.txt")?;
+
+        assert_eq!(state, WriteTargetState::Missing);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_target_state_changes_when_content_changes() -> Result<(), String> {
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-write-state-change-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let target = workspace.join("config.txt");
+
+        std::fs::write(&target, "version-a")
+            .map_err(|error| format!("failed to create test target: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let before = filesystem.capture_write_target_state("config.txt")?;
+
+        std::fs::write(&target, "version-b")
+            .map_err(|error| format!("failed to modify test target: {error}"))?;
+
+        let after = filesystem.capture_write_target_state("config.txt")?;
+
+        assert_ne!(before, after);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
 
         Ok(())
     }

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::execution::{ExecutionRequest, HttpMethod, HttpRequestArguments, WriteFileArguments};
+use crate::filesystem::WriteTargetState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingReview {
@@ -19,6 +20,7 @@ pub struct PendingReview {
     pub request: ExecutionRequest,
     pub purpose: String,
     pub workspace_fingerprint: Option<String>,
+    pub write_target_state: Option<WriteTargetState>,
 }
 
 impl PendingReview {
@@ -28,6 +30,7 @@ impl PendingReview {
             request,
             purpose,
             workspace_fingerprint: None,
+            write_target_state: None,
         }
     }
 
@@ -42,9 +45,26 @@ impl PendingReview {
             request,
             purpose,
             workspace_fingerprint: Some(workspace_fingerprint),
+            write_target_state: None,
+        }
+    }
+
+    pub fn new_with_write_target_state(
+        request_id: Uuid,
+        request: ExecutionRequest,
+        purpose: String,
+        write_target_state: WriteTargetState,
+    ) -> Self {
+        Self {
+            request_id,
+            request,
+            purpose,
+            workspace_fingerprint: None,
+            write_target_state: Some(write_target_state),
         }
     }
 }
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct PersistedPendingReviewState {
     version: u32,
@@ -58,6 +78,7 @@ struct PersistedPendingReview {
     status: PersistedReviewStatus,
     operation: PersistedReviewOperation,
 }
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PersistedReviewStatus {
@@ -68,19 +89,37 @@ enum PersistedReviewStatus {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PersistedReviewOperation {
-    WriteFile { path: String, content: String },
-    RunCargoTest { workspace_fingerprint: String },
-    HttpPost { url: String, body: Option<String> },
+    WriteFile {
+        path: String,
+        content: String,
+        target_state: WriteTargetState,
+    },
+    RunCargoTest {
+        workspace_fingerprint: String,
+    },
+    HttpPost {
+        url: String,
+        body: Option<String>,
+    },
 }
+
 impl TryFrom<&PendingReview> for PersistedPendingReview {
     type Error = String;
 
     fn try_from(pending: &PendingReview) -> Result<Self, Self::Error> {
         let operation = match &pending.request {
-            ExecutionRequest::WriteFile(arguments) => PersistedReviewOperation::WriteFile {
-                path: arguments.path.clone(),
-                content: arguments.content.clone(),
-            },
+            ExecutionRequest::WriteFile(arguments) => {
+                let target_state = pending
+                    .write_target_state
+                    .clone()
+                    .ok_or_else(|| "write pending review is missing target state".to_owned())?;
+
+                PersistedReviewOperation::WriteFile {
+                    path: arguments.path.clone(),
+                    content: arguments.content.clone(),
+                    target_state,
+                }
+            }
 
             ExecutionRequest::RunCargoTest => {
                 let workspace_fingerprint =
@@ -119,8 +158,17 @@ impl TryFrom<PersistedPendingReview> for PendingReview {
 
     fn try_from(persisted: PersistedPendingReview) -> Result<Self, Self::Error> {
         let request = match persisted.operation {
-            PersistedReviewOperation::WriteFile { path, content } => {
-                ExecutionRequest::WriteFile(WriteFileArguments { path, content })
+            PersistedReviewOperation::WriteFile {
+                path,
+                content,
+                target_state,
+            } => {
+                return Ok(PendingReview::new_with_write_target_state(
+                    persisted.request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments { path, content }),
+                    persisted.purpose,
+                    target_state,
+                ));
             }
 
             PersistedReviewOperation::RunCargoTest {
@@ -150,8 +198,9 @@ impl TryFrom<PersistedPendingReview> for PendingReview {
         ))
     }
 }
+
 impl PersistedPendingReviewState {
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 }
 
 #[derive(Debug, Default)]
@@ -172,10 +221,12 @@ impl PendingReviewStore {
             None => Ok(()),
         }
     }
+
     #[cfg(test)]
     pub fn get_claimed(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.claimed_reviews.get(request_id)
     }
+
     pub fn serialize_state(&self) -> Result<String, String> {
         let mut reviews = Vec::new();
 
@@ -199,6 +250,7 @@ impl PendingReviewStore {
         serde_json::to_string_pretty(&state)
             .map_err(|error| format!("failed to serialize pending review state: {error}"))
     }
+
     pub fn consume_claimed(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
         let claimed = self
             .claimed_reviews
@@ -215,6 +267,7 @@ impl PendingReviewStore {
 
         Ok(claimed)
     }
+
     pub fn from_serialized_state(input: &str) -> Result<Self, String> {
         let state: PersistedPendingReviewState = serde_json::from_str(input)
             .map_err(|error| format!("failed to deserialize pending review state: {error}"))?;
@@ -252,6 +305,7 @@ impl PendingReviewStore {
 
         Ok(store)
     }
+
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         let mut store = match std::fs::read_to_string(path) {
             Ok(contents) => Self::from_serialized_state(&contents)?,
@@ -270,6 +324,7 @@ impl PendingReviewStore {
 
         Ok(store)
     }
+
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
         let serialized = self.serialize_state()?;
 
@@ -340,6 +395,7 @@ impl PendingReviewStore {
 
         Ok(())
     }
+
     #[cfg(test)]
     pub fn take(&mut self, request_id: &Uuid) -> Result<Option<PendingReview>, String> {
         let removed = self.reviews.remove(request_id);
@@ -384,6 +440,7 @@ impl PendingReviewStore {
 
         Ok(pending)
     }
+
     pub fn restore_claimed(&mut self, pending: PendingReview) -> Result<(), String> {
         let request_id = pending.request_id;
 
@@ -398,6 +455,7 @@ impl PendingReviewStore {
 
         if claimed != pending {
             self.claimed_reviews.insert(request_id, claimed);
+
             return Err("claimed review does not match restoration request".to_owned());
         }
 
@@ -430,6 +488,7 @@ impl PendingReviewStore {
 mod tests {
     use super::{PendingReview, PendingReviewStore};
     use crate::execution::{ExecutionRequest, WriteFileArguments};
+    use crate::filesystem::WriteTargetState;
 
     #[test]
     fn stores_and_retrieves_pending_review_by_request_id() {
@@ -485,6 +544,7 @@ mod tests {
             store.claim(&request_id),
             Err("pending review request is already claimed".to_owned())
         );
+
         Ok(())
     }
 
@@ -513,6 +573,7 @@ mod tests {
         let mut store = PendingReviewStore::new();
 
         assert!(store.insert(original).is_ok());
+
         assert_eq!(
             store.insert(duplicate),
             Err("pending review request ID already exists".to_owned())
@@ -524,6 +585,7 @@ mod tests {
             stored.map(|review| review.purpose.as_str()),
             Some("Original request")
         );
+
         assert_eq!(store.len(), 1);
     }
 
@@ -546,6 +608,7 @@ mod tests {
         assert_eq!(pending.request, request);
         assert_eq!(pending.purpose, "Update application configuration");
     }
+
     #[test]
     fn taking_pending_review_removes_it_from_store() {
         let request_id = uuid::Uuid::new_v4();
@@ -573,6 +636,7 @@ mod tests {
 
         assert_eq!(second_take, Ok(None));
     }
+
     #[test]
     fn restores_claimed_review_for_safe_retry() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
@@ -601,6 +665,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn restore_claimed_refuses_to_replace_existing_review() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
@@ -633,22 +698,25 @@ mod tests {
             result,
             Err("pending review request ID already exists".to_owned())
         );
+
         assert_eq!(store.get(&request_id), Some(&original));
         assert_eq!(store.len(), 1);
 
         Ok(())
     }
+
     #[test]
     fn serialized_pending_review_state_round_trips() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         let mut store = PendingReviewStore::new();
@@ -661,12 +729,13 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn rejects_unsupported_persisted_state_version() {
         let input = r#"{
-        "version": 999,
-        "reviews": []
-    }"#;
+            "version": 999,
+            "reviews": []
+        }"#;
 
         let result = PendingReviewStore::from_serialized_state(input);
 
@@ -674,6 +743,7 @@ mod tests {
 
         assert_eq!(error, "unsupported pending review state version: 999");
     }
+
     #[cfg(unix)]
     #[test]
     fn saves_pending_review_state_as_private_file() -> Result<(), String> {
@@ -691,18 +761,19 @@ mod tests {
         let state_path = test_root.join("pending-reviews.json");
         let request_id = uuid::Uuid::new_v4();
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         let mut store = PendingReviewStore::new();
-        store.insert(pending.clone())?;
 
+        store.insert(pending.clone())?;
         store.save_to_path(&state_path)?;
 
         let serialized = fs::read_to_string(&state_path)
@@ -725,6 +796,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn missing_pending_review_state_file_loads_empty_store() -> Result<(), String> {
         let state_path = std::env::temp_dir().join(format!(
@@ -738,6 +810,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn corrupt_pending_review_state_is_rejected() -> Result<(), String> {
         use std::fs;
@@ -764,6 +837,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn memory_only_store_persist_is_no_op() -> Result<(), String> {
         let store = PendingReviewStore::new();
@@ -772,6 +846,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_insert_is_saved_to_disk() -> Result<(), String> {
         use std::fs;
@@ -789,13 +864,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         store.insert(pending.clone())?;
@@ -809,6 +885,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_claim_moves_review_to_claimed_state() -> Result<(), String> {
         use std::fs;
@@ -826,13 +903,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         store.insert(pending.clone())?;
@@ -851,6 +929,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_take_removes_review_from_disk() -> Result<(), String> {
         use std::fs;
@@ -868,13 +947,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         store.insert(pending.clone())?;
@@ -893,6 +973,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_restore_claimed_is_saved_to_disk() -> Result<(), String> {
         use std::fs;
@@ -910,13 +991,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         store.insert(pending.clone())?;
@@ -936,6 +1018,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn pending_review_survives_store_reload() -> Result<(), String> {
         use std::fs;
@@ -954,13 +1037,14 @@ mod tests {
         {
             let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-            store.insert(PendingReview::new(
+            store.insert(PendingReview::new_with_write_target_state(
                 request_id,
                 ExecutionRequest::WriteFile(WriteFileArguments {
                     path: "config/settings.txt".to_owned(),
                     content: "enabled=true".to_owned(),
                 }),
                 "Update application configuration".to_owned(),
+                WriteTargetState::Missing,
             ))?;
         }
 
@@ -971,6 +1055,7 @@ mod tests {
             .ok_or_else(|| "pending review did not survive reload".to_owned())?;
 
         assert_eq!(pending.request_id, request_id);
+
         assert_eq!(pending.purpose, "Update application configuration");
 
         fs::remove_dir_all(&test_root)
@@ -978,6 +1063,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_claim_is_not_silently_lost_after_restart() -> Result<(), String> {
         use std::fs;
@@ -995,13 +1081,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        store.insert(PendingReview::new(
+        store.insert(PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         ))?;
 
         let _claimed = store.claim(&request_id)?;
@@ -1023,6 +1110,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn persistent_consume_removes_claimed_review_from_disk() -> Result<(), String> {
         use std::fs;
@@ -1040,13 +1128,14 @@ mod tests {
 
         let mut store = PendingReviewStore::load_from_path(&state_path)?;
 
-        let pending = PendingReview::new(
+        let pending = PendingReview::new_with_write_target_state(
             request_id,
             ExecutionRequest::WriteFile(WriteFileArguments {
                 path: "config/settings.txt".to_owned(),
                 content: "enabled=true".to_owned(),
             }),
             "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
         );
 
         store.insert(pending.clone())?;
