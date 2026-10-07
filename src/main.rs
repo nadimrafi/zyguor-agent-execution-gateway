@@ -1609,6 +1609,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_review_store = PendingReviewStore::load_from_path(&pending_review_state_path)
         .map_err(|error| format!("failed to load pending review state: {error}"))?;
 
+    let claimed_review_count = pending_review_store.claimed_count();
+
+    if claimed_review_count > 0 {
+        eprintln!(
+            "SECURITY WARNING: {claimed_review_count} claimed review(s) survived restart and require \
+         operator reconciliation; they will not be automatically re-executed."
+        );
+    }
+
     let pending_reviews = Arc::new(Mutex::new(pending_review_store));
 
     let filesystem = FileSystemCapability::try_new(workspace_root.into())?;

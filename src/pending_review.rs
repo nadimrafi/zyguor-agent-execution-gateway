@@ -226,6 +226,9 @@ impl PendingReviewStore {
     pub fn get_claimed(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.claimed_reviews.get(request_id)
     }
+    pub fn claimed_count(&self) -> usize {
+        self.claimed_reviews.len()
+    }
 
     pub fn serialize_state(&self) -> Result<String, String> {
         let mut reviews = Vec::new();
@@ -1154,6 +1157,30 @@ mod tests {
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn claimed_count_reports_claimed_reviews() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::new();
+
+        store.insert(PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
+        ))?;
+
+        assert_eq!(store.claimed_count(), 0);
+
+        store.claim(&request_id)?;
+
+        assert_eq!(store.claimed_count(), 1);
 
         Ok(())
     }
