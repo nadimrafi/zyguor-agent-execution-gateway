@@ -2043,6 +2043,157 @@ mod gateway_tests {
 
         Ok(())
     }
+    #[test]
+    fn write_approval_rejects_target_created_after_review() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-write-target-created-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let write_target_state = filesystem.capture_write_target_state("config.txt")?;
+
+        assert_eq!(
+            write_target_state,
+            crate::filesystem::WriteTargetState::Missing
+        );
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_write_target_state(
+                    request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments {
+                        path: "config.txt".to_owned(),
+                        content: "approved replacement".to_owned(),
+                    }),
+                    "Test newly created write target rejection".to_owned(),
+                    write_target_state,
+                ),
+            )?;
+        }
+
+        let target = workspace.join("config.txt");
+
+        std::fs::write(&target, "created after review")
+            .map_err(|error| format!("failed to create target after review: {error}"))?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("newly created write target approval should fail");
+
+        assert!(
+            error.contains("pending write target changed after review"),
+            "unexpected error: {error}"
+        );
+
+        let current_content = std::fs::read_to_string(&target)
+            .map_err(|error| format!("failed to read created target: {error}"))?;
+
+        assert_eq!(current_content, "created after review");
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn write_approval_rejects_target_deleted_after_review() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+        let pending_reviews = empty_pending_review_store();
+
+        let workspace = std::env::temp_dir().join(format!(
+            "zyguor-write-target-deleted-test-{}-{request_id}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        let target = workspace.join("config.txt");
+
+        std::fs::write(&target, "original content")
+            .map_err(|error| format!("failed to create initial target: {error}"))?;
+
+        let filesystem = FileSystemCapability::try_new(workspace.clone())?;
+
+        let write_target_state = filesystem.capture_write_target_state("config.txt")?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(
+                crate::pending_review::PendingReview::new_with_write_target_state(
+                    request_id,
+                    ExecutionRequest::WriteFile(WriteFileArguments {
+                        path: "config.txt".to_owned(),
+                        content: "approved replacement".to_owned(),
+                    }),
+                    "Test deleted write target rejection".to_owned(),
+                    write_target_state,
+                ),
+            )?;
+        }
+
+        std::fs::remove_file(&target)
+            .map_err(|error| format!("failed to delete target after review: {error}"))?;
+
+        let result = handle_admin_command(
+            AdminCommand::Approve { request_id },
+            &pending_reviews,
+            &filesystem,
+        );
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("deleted write target approval should fail");
+
+        assert!(
+            error.contains("pending write target changed after review"),
+            "unexpected error: {error}"
+        );
+
+        assert!(!target.exists());
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert!(store.get(&request_id).is_some());
+
+        drop(store);
+
+        std::fs::remove_dir_all(&workspace)
+            .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
 
     #[test]
     fn approval_revalidates_write_target_and_retains_invalid_request() -> Result<(), String> {
