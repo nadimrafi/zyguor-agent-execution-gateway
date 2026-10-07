@@ -139,6 +139,7 @@ struct ZyguorGateway {
     filesystem: FileSystemCapability,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     config: Arc<GatewayConfig>,
+    audit_log_path: Arc<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,12 +372,14 @@ where
     serde_json::to_string(&response)
         .map_err(|error| format!("failed to serialize gateway response: {error}"))
 }
-fn validate_pending_review_state_path(
+fn validate_operational_state_path(
     workspace_root: &Path,
     state_path: &Path,
+    setting_name: &str,
+    file_description: &str,
 ) -> Result<(), String> {
     if !state_path.is_absolute() {
-        return Err("ZYGUOR_PENDING_REVIEW_STATE_PATH must be an absolute path".to_owned());
+        return Err(format!("{setting_name} must be an absolute path"));
     }
 
     let canonical_workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
@@ -388,20 +391,41 @@ fn validate_pending_review_state_path(
 
     let parent = state_path
         .parent()
-        .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
+        .ok_or_else(|| format!("{file_description} path must have a parent directory"))?;
 
     let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
         format!(
-            "failed to resolve pending review state parent '{}': {error}",
+            "failed to resolve {file_description} parent '{}': {error}",
             parent.display()
         )
     })?;
 
     let file_name = state_path
         .file_name()
-        .ok_or_else(|| "pending review state path must include a file name".to_owned())?;
+        .ok_or_else(|| format!("{file_description} path must include a file name"))?;
 
     let candidate = canonical_parent.join(file_name);
+
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("{file_description} must not be a symbolic link"));
+            }
+
+            if !metadata.is_file() {
+                return Err(format!("{file_description} must be a regular file"));
+            }
+        }
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect {file_description} '{}': {error}",
+                candidate.display()
+            ));
+        }
+    }
 
     let resolved_state_path = match std::fs::canonicalize(&candidate) {
         Ok(path) => path,
@@ -410,14 +434,16 @@ fn validate_pending_review_state_path(
 
         Err(error) => {
             return Err(format!(
-                "failed to resolve pending review state path '{}': {error}",
+                "failed to resolve {file_description} '{}': {error}",
                 candidate.display()
             ));
         }
     };
 
     if resolved_state_path.starts_with(&canonical_workspace) {
-        return Err("pending review state file must be outside the agent workspace".to_owned());
+        return Err(format!(
+            "{file_description} must be outside the agent workspace"
+        ));
     }
 
     Ok(())
@@ -989,6 +1015,7 @@ fn handle_admin_command_with_http_runner<H>(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
+    audit_log_path: &Path,
     http_post_runner: H,
 ) -> Result<AdminOutcome, String>
 where
@@ -1008,14 +1035,18 @@ where
 
             drop(store);
 
-            audit_claimed_approval(&claimed, pending_reviews, persist_audit)?;
+            audit_claimed_approval(&claimed, pending_reviews, |record| {
+                persist_audit(audit_log_path, record)
+            })?;
 
             match &claimed.request {
                 ExecutionRequest::WriteFile(arguments) => {
-                    let outcome =
-                        execute_claimed_write(&claimed, pending_reviews, persist_audit, || {
-                            filesystem.write_text_file(&arguments.path, &arguments.content)
-                        })?;
+                    let outcome = execute_claimed_write(
+                        &claimed,
+                        pending_reviews,
+                        |record| persist_audit(audit_log_path, record),
+                        || filesystem.write_text_file(&arguments.path, &arguments.content),
+                    )?;
                     match outcome {
                         ReviewedExecutionOutcome::Success => {
                             Ok(AdminOutcome::Approved { request_id })
@@ -1051,7 +1082,7 @@ where
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
-                        persist_audit,
+                        |record| persist_audit(audit_log_path, record),
                         || execute_cargo_test_with_config(filesystem, config, expected_fingerprint),
                     )?;
 
@@ -1097,7 +1128,7 @@ where
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
-                        persist_audit,
+                        |record| persist_audit(audit_log_path, record),
                         || http_post_runner(arguments),
                     )?;
 
@@ -1144,7 +1175,9 @@ where
         AdminCommand::Reject { request_id } => {
             let pending = reject_pending_request(request_id, pending_reviews)?;
 
-            audit_claimed_rejection(&pending, pending_reviews, persist_audit)?;
+            audit_claimed_rejection(&pending, pending_reviews, |record| {
+                persist_audit(audit_log_path, record)
+            })?;
 
             Ok(AdminOutcome::Rejected { pending })
         }
@@ -1155,12 +1188,14 @@ fn handle_admin_command_with_config(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
+    audit_log_path: &Path,
 ) -> Result<AdminOutcome, String> {
     handle_admin_command_with_http_runner(
         command,
         pending_reviews,
         filesystem,
         config,
+        audit_log_path,
         |arguments| execute_http_post_with_config(arguments, config),
     )
 }
@@ -1170,6 +1205,7 @@ fn execute_request_with_http_runner<H>(
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
+    audit_log_path: &Path,
     http_runner: H,
 ) -> Result<String, String>
 where
@@ -1228,7 +1264,7 @@ where
         request_id,
         &params.context.purpose,
         evaluation,
-        persist_audit,
+        |record| persist_audit(audit_log_path, record),
         || match request {
             ExecutionRequest::HttpRequest(arguments) => match arguments.method {
                 HttpMethod::Get => {
@@ -1276,12 +1312,14 @@ fn execute_request_with_config(
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
+    audit_log_path: &Path,
 ) -> Result<String, String> {
     execute_request_with_http_runner(
         params,
         filesystem,
         pending_reviews,
         config,
+        audit_log_path,
         |method, destination, body| {
             let executor = HttpExecutor::new(config.http.execution)?;
 
@@ -1301,6 +1339,7 @@ impl ZyguorGateway {
             &self.filesystem,
             &self.pending_reviews,
             self.config.as_ref(),
+            self.audit_log_path.as_path(),
         ) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
@@ -1370,6 +1409,7 @@ async fn handle_admin_connection(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
+    audit_log_path: &Path,
 ) -> Result<AdminOutcome, String> {
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
@@ -1400,9 +1440,13 @@ async fn handle_admin_connection(
     }
 
     let result = match parse_admin_command(&input) {
-        Ok(command) => {
-            handle_admin_command_with_config(command, pending_reviews, filesystem, config)
-        }
+        Ok(command) => handle_admin_command_with_config(
+            command,
+            pending_reviews,
+            filesystem,
+            config,
+            audit_log_path,
+        ),
         Err(error) => Err(error),
     };
 
@@ -1466,6 +1510,7 @@ async fn run_admin_listener(
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     filesystem: FileSystemCapability,
     config: Arc<GatewayConfig>,
+    audit_log_path: Arc<PathBuf>,
 ) -> Result<(), String> {
     loop {
         let (stream, _) = listener
@@ -1473,8 +1518,14 @@ async fn run_admin_listener(
             .await
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
-        if let Err(error) =
-            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await
+        if let Err(error) = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            audit_log_path.as_path(),
+        )
+        .await
         {
             eprintln!("admin command rejected: {error}");
         }
@@ -1532,8 +1583,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ZYGUOR_PENDING_REVIEW_STATE_PATH must be set to an operational state file outside the agent workspace"
             .to_owned()
     })?;
-    validate_pending_review_state_path(Path::new(&workspace_root), &pending_review_state_path)?;
 
+    validate_operational_state_path(
+        Path::new(&workspace_root),
+        &pending_review_state_path,
+        "ZYGUOR_PENDING_REVIEW_STATE_PATH",
+        "pending review state file",
+    )?;
+
+    let audit_log_path = std::env::var("ZYGUOR_AUDIT_LOG_PATH")
+    .map(PathBuf::from)
+    .map_err(|_| {
+        "ZYGUOR_AUDIT_LOG_PATH must be set to an operational audit file outside the agent workspace"
+            .to_owned()
+    })?;
+
+    validate_operational_state_path(
+        Path::new(&workspace_root),
+        &audit_log_path,
+        "ZYGUOR_AUDIT_LOG_PATH",
+        "audit log file",
+    )?;
+
+    let audit_log_path = Arc::new(audit_log_path);
     let pending_review_store = PendingReviewStore::load_from_path(&pending_review_state_path)
         .map_err(|error| format!("failed to load pending review state: {error}"))?;
 
@@ -1545,6 +1617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         filesystem: filesystem.clone(),
         pending_reviews: Arc::clone(&pending_reviews),
         config: Arc::clone(&config),
+        audit_log_path: Arc::clone(&audit_log_path),
     };
 
     let admin_task = tokio::spawn(run_admin_listener(
@@ -1552,6 +1625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&pending_reviews),
         filesystem,
         Arc::clone(&config),
+        Arc::clone(&audit_log_path),
     ));
 
     let gateway_result = async {
@@ -1576,6 +1650,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(admin_socket_guard);
 
     gateway_result
+}
+#[cfg(test)]
+fn test_audit_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("zyguor-test-audit-{}.jsonl", uuid::Uuid::new_v4()))
+}
+
+#[cfg(test)]
+fn remove_test_audit_log(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 #[cfg(test)]
 fn evaluate_request(
@@ -1603,7 +1690,19 @@ fn handle_admin_command(
 ) -> Result<AdminOutcome, String> {
     let config = GatewayConfig::default();
 
-    handle_admin_command_with_config(command, pending_reviews, filesystem, &config)
+    let audit_log_path = test_audit_log_path();
+
+    let result = handle_admin_command_with_config(
+        command,
+        pending_reviews,
+        filesystem,
+        &config,
+        &audit_log_path,
+    );
+
+    remove_test_audit_log(&audit_log_path);
+
+    result
 }
 #[cfg(test)]
 fn execute_request(
@@ -1613,7 +1712,19 @@ fn execute_request(
 ) -> Result<String, String> {
     let config = GatewayConfig::default();
 
-    execute_request_with_config(params, filesystem, pending_reviews, &config)
+    let audit_log_path = test_audit_log_path();
+
+    let result = execute_request_with_config(
+        params,
+        filesystem,
+        pending_reviews,
+        &config,
+        &audit_log_path,
+    );
+
+    remove_test_audit_log(&audit_log_path);
+
+    result
 }
 
 #[cfg(test)]
@@ -1630,8 +1741,9 @@ mod gateway_tests {
         execute_http_post_with_config, execute_message_with_audit_id, execute_request,
         execute_request_with_http_runner, handle_admin_command,
         handle_admin_command_with_http_runner, handle_admin_connection, parse_admin_command,
-        reject_pending_request, revalidate_pending_request, review_reason_for_request,
-        run_infinite_loop_with_fuel, stop_admin_task,
+        reject_pending_request, remove_test_audit_log, revalidate_pending_request,
+        review_reason_for_request, run_infinite_loop_with_fuel, stop_admin_task,
+        test_audit_log_path,
     };
     use crate::execution::HttpRequestArguments;
     use crate::pending_review::{PendingReview, PendingReviewStore};
@@ -1642,6 +1754,7 @@ mod gateway_tests {
     fn no_op_audit(_: &crate::audit::AuditRecord<'_>) -> Result<(), String> {
         Ok(())
     }
+
     fn empty_pending_review_store() -> Arc<Mutex<PendingReviewStore>> {
         Arc::new(Mutex::new(PendingReviewStore::new()))
     }
@@ -1742,8 +1855,19 @@ mod gateway_tests {
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
-        let rejected =
-            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await?;
+
+        let audit_log_path = test_audit_log_path();
+
+        let rejected = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+        )
+        .await?;
+
+        remove_test_audit_log(&audit_log_path);
 
         let response = client
             .await
@@ -1872,9 +1996,16 @@ mod gateway_tests {
             .map_err(|error| format!("failed to accept admin connection: {error}"))?;
 
         let config = GatewayConfig::default();
-        let outcome =
-            handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await?;
-
+        let audit_log_path = test_audit_log_path();
+        let outcome = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+        )
+        .await?;
+        remove_test_audit_log(&audit_log_path);
         let response = client
             .await
             .map_err(|error| format!("admin client task failed: {error}"))??;
@@ -2302,7 +2433,18 @@ mod gateway_tests {
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
+        let audit_log_path = test_audit_log_path();
+
+        let result = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+        )
+        .await;
+
+        remove_test_audit_log(&audit_log_path);
 
         let response = client
             .await
@@ -2370,7 +2512,18 @@ mod gateway_tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
 
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
+        let audit_log_path = test_audit_log_path();
+
+        let result = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+        )
+        .await;
+
+        remove_test_audit_log(&audit_log_path);
 
         let response = client
             .await
@@ -2430,7 +2583,18 @@ mod gateway_tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
 
-        let result = handle_admin_connection(stream, &pending_reviews, &filesystem, &config).await;
+        let audit_log_path = test_audit_log_path();
+
+        let result = handle_admin_connection(
+            stream,
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+        )
+        .await;
+
+        remove_test_audit_log(&audit_log_path);
 
         let response = client
             .await
@@ -4177,18 +4341,21 @@ mod tests {
         };
 
         let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
 
         let result = execute_request_with_http_runner(
             &params,
             &filesystem,
             &pending_reviews,
             &config,
+            &audit_log_path,
             |method, destination, body| {
                 assert_eq!(method, HttpMethod::Get);
                 assert_eq!(
                     destination.as_url().as_str(),
                     "https://api.example.com/status"
                 );
+
                 assert!(body.is_none());
 
                 Ok(HttpExecutionResult {
@@ -4199,6 +4366,7 @@ mod tests {
                 })
             },
         )?;
+        remove_test_audit_log(&audit_log_path);
 
         let json: serde_json::Value = serde_json::from_str(&result)
             .map_err(|error| format!("failed to parse gateway response: {error}"))?;
@@ -4667,11 +4835,13 @@ mod tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
 
         let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
+            &audit_log_path,
             |arguments| {
                 assert_eq!(arguments.method, HttpMethod::Post);
                 assert_eq!(arguments.url, "https://api.example.com/items");
@@ -4688,6 +4858,7 @@ mod tests {
                 )))
             },
         )?;
+        remove_test_audit_log(&audit_log_path);
 
         match outcome {
             AdminOutcome::HttpPostCompleted {
@@ -4739,11 +4910,13 @@ mod tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
 
         let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
+            &audit_log_path,
             |_arguments| {
                 let result = HttpExecutionResult {
                     status_code: 500,
@@ -4758,6 +4931,7 @@ mod tests {
                 })
             },
         )?;
+        remove_test_audit_log(&audit_log_path);
 
         match outcome {
             AdminOutcome::HttpPostFailed {
@@ -4799,14 +4973,17 @@ mod tests {
 
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
 
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
+            &audit_log_path,
             |_arguments| Err("HTTP request failed: simulated transport failure".to_owned()),
         )?;
+        remove_test_audit_log(&audit_log_path);
 
         match outcome {
             AdminOutcome::HttpPostExecutionFailed {
@@ -5417,7 +5594,12 @@ mod tests {
 
         let state_path = operational_dir.join("pending-reviews.json");
 
-        let result = super::validate_pending_review_state_path(&workspace, &state_path);
+        let result = super::validate_operational_state_path(
+            &workspace,
+            &state_path,
+            "ZYGUOR_PENDING_REVIEW_STATE_PATH",
+            "pending review state file",
+        );
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
@@ -5443,7 +5625,12 @@ mod tests {
 
         let state_path = state_dir.join("pending-reviews.json");
 
-        let result = super::validate_pending_review_state_path(&workspace, &state_path);
+        let result = super::validate_operational_state_path(
+            &workspace,
+            &state_path,
+            "ZYGUOR_PENDING_REVIEW_STATE_PATH",
+            "pending review state file",
+        );
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
@@ -5541,5 +5728,49 @@ mod tests {
             error.starts_with("admin listener task failed:"),
             "unexpected error: {error}"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn operational_state_path_rejects_final_symlink() -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "zyguor-operational-state-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let workspace = base.join("workspace");
+        let state_dir = base.join("state");
+        let real_state_file = state_dir.join("real-state.json");
+        let state_path = state_dir.join("pending-state.json");
+
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
+
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|error| format!("failed to create test state directory: {error}"))?;
+
+        std::fs::write(&real_state_file, "{}")
+            .map_err(|error| format!("failed to create real state file: {error}"))?;
+
+        symlink(&real_state_file, &state_path)
+            .map_err(|error| format!("failed to create state symlink: {error}"))?;
+
+        let result = super::validate_operational_state_path(
+            &workspace,
+            &state_path,
+            "ZYGUOR_PENDING_REVIEW_STATE_PATH",
+            "pending review state file",
+        );
+
+        std::fs::remove_dir_all(&base)
+            .map_err(|error| format!("failed to remove test directories: {error}"))?;
+
+        assert_eq!(
+            result,
+            Err("pending review state file must not be a symbolic link".to_owned())
+        );
+
+        Ok(())
     }
 }
