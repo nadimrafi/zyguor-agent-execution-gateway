@@ -4119,7 +4119,7 @@ mod tests {
         std::fs::write(&file_path, "Hello from Zyguor")
             .map_err(|error| format!("failed to write test file: {error}"))?;
 
-        let filesystem = FileSystemCapability::new(workspace_root.clone());
+        let filesystem = FileSystemCapability::try_new(workspace_root.clone())?;
 
         let params = ExecuteParams {
             operation: "read_file".to_owned(),
@@ -4297,7 +4297,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_root)
             .map_err(|error| format!("failed to create test workspace: {error}"))?;
 
-        let filesystem = FileSystemCapability::new(workspace_root.clone());
+        let filesystem = FileSystemCapability::try_new(workspace_root.clone())?;
 
         let params = ExecuteParams {
             operation: "read_file".to_owned(),

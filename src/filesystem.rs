@@ -2,7 +2,7 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
-use std::fs::File;
+
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -344,9 +344,43 @@ impl FileSystemCapability {
         write_result
     }
     pub fn read_text_file(&self, requested_path: &str) -> Result<String, String> {
-        let resolved_path = self.resolve_existing_path(requested_path)?;
+        self.validate_relative_path(requested_path)?;
 
-        let file = File::open(&resolved_path)
+        let relative_path = Path::new(requested_path);
+
+        let workspace = self
+            .workspace_dir
+            .as_ref()
+            .ok_or_else(|| "file read requires an anchored workspace capability".to_owned())?;
+
+        let parent = relative_path
+            .parent()
+            .ok_or_else(|| "read target must have a parent directory".to_owned())?;
+
+        if !parent.as_os_str().is_empty() {
+            workspace
+                .open_dir_nofollow(parent)
+                .map_err(|error| format!("failed to validate read target parent: {error}"))?;
+        }
+
+        let metadata = workspace
+            .symlink_metadata(relative_path)
+            .map_err(|error| format!("failed to inspect requested file: {error}"))?;
+
+        if metadata.file_type().is_symlink() {
+            return Err("read target must not be a symbolic link".to_owned());
+        }
+
+        if !metadata.is_file() {
+            return Err("read target must be a regular file".to_owned());
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+
+        let file = workspace
+            .open_with(relative_path, &options)
             .map_err(|error| format!("failed to open requested file: {error}"))?;
 
         let mut buffer = Vec::new();
@@ -655,7 +689,7 @@ mod tests {
         fs::write(workspace.join("hello.txt"), "Hello from Zyguor")
             .map_err(|error| format!("failed to create test file: {error}"))?;
 
-        let capability = FileSystemCapability::new(workspace);
+        let capability = FileSystemCapability::try_new(workspace)?;
 
         let content = capability.read_text_file("hello.txt")?;
 
@@ -685,7 +719,7 @@ mod tests {
         fs::write(workspace.join("large.txt"), oversized_content)
             .map_err(|error| format!("failed to create oversized test file: {error}"))?;
 
-        let capability = FileSystemCapability::new(workspace);
+        let capability = FileSystemCapability::try_new(workspace)?;
 
         let result = capability.read_text_file("large.txt");
 
@@ -717,7 +751,7 @@ mod tests {
         fs::write(workspace.join("binary.dat"), [0xff, 0xfe, 0xfd])
             .map_err(|error| format!("failed to create invalid UTF-8 test file: {error}"))?;
 
-        let capability = FileSystemCapability::new(workspace);
+        let capability = FileSystemCapability::try_new(workspace)?;
 
         let result = capability.read_text_file("binary.dat");
 
@@ -1444,6 +1478,90 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace)
             .map_err(|error| format!("failed to remove test workspace: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn secure_read_rejects_final_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-read-symlink-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside = test_root.join("outside");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&outside)
+            .map_err(|error| format!("failed to create outside directory: {error}"))?;
+
+        fs::write(outside.join("secret.txt"), "outside secret")
+            .map_err(|error| format!("failed to create outside test file: {error}"))?;
+
+        symlink(
+            outside.join("secret.txt"),
+            workspace.join("secret-link.txt"),
+        )
+        .map_err(|error| format!("failed to create test symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.read_text_file("secret-link.txt");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        let error = result.expect_err("symlink read should be rejected");
+
+        assert_eq!(error, "read target must not be a symbolic link");
+
+        Ok(())
+    }
+    #[test]
+    fn secure_read_rejects_symlinked_parent_directory() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-filesystem-read-parent-symlink-test-{}",
+            std::process::id()
+        ));
+
+        let workspace = test_root.join("workspace");
+        let outside = test_root.join("outside");
+
+        fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create workspace: {error}"))?;
+
+        fs::create_dir_all(&outside)
+            .map_err(|error| format!("failed to create outside directory: {error}"))?;
+
+        fs::write(outside.join("secret.txt"), "outside secret")
+            .map_err(|error| format!("failed to create outside test file: {error}"))?;
+
+        symlink(&outside, workspace.join("linked"))
+            .map_err(|error| format!("failed to create parent directory symlink: {error}"))?;
+
+        let capability = FileSystemCapability::try_new(workspace)?;
+
+        let result = capability.read_text_file("linked/secret.txt");
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        assert!(result.is_err());
+
+        let error = result.expect_err("read through symlinked parent directory should be rejected");
+
+        assert!(
+            error.contains("failed to validate read target parent"),
+            "unexpected error: {error}"
+        );
 
         Ok(())
     }
