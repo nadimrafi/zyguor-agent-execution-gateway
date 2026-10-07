@@ -146,13 +146,18 @@ struct ZyguorGateway {
 enum AdminCommand {
     Approve { request_id: uuid::Uuid },
     Reject { request_id: uuid::Uuid },
+    AcknowledgeClaimed { request_id: uuid::Uuid },
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AdminOutcome {
     Approved {
         request_id: uuid::Uuid,
     },
     Rejected {
+        pending: PendingReview,
+    },
+    ClaimedAcknowledged {
         pending: PendingReview,
     },
     WriteFailed {
@@ -203,6 +208,9 @@ fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
         }
         AdminOutcome::CargoTestExecutionFailed { request_id, error } => {
             format!("ERROR CARGO_TEST_EXECUTION_FAILED {request_id} {error}\n")
+        }
+        AdminOutcome::ClaimedAcknowledged { pending } => {
+            format!("OK CLAIMED_ACKNOWLEDGED {}\n", pending.request_id)
         }
         AdminOutcome::CargoTestCompleted { request_id, result } => {
             match serde_json::to_string(result) {
@@ -274,6 +282,7 @@ fn parse_admin_command(input: &str) -> Result<AdminCommand, String> {
     match command {
         "APPROVE" => Ok(AdminCommand::Approve { request_id }),
         "REJECT" => Ok(AdminCommand::Reject { request_id }),
+        "ACK_CLAIMED" => Ok(AdminCommand::AcknowledgeClaimed { request_id }),
         _ => Err("unsupported admin command".to_owned()),
     }
 }
@@ -354,6 +363,7 @@ where
             ExecutionOutcome::Success => "execution_completed_audit_failed",
             ExecutionOutcome::Failed => "execution_failed_audit_failed",
             ExecutionOutcome::NotExecuted => status,
+            ExecutionOutcome::Unknown => "execution_unknown_audit_failed",
         }
     } else {
         status
@@ -753,6 +763,26 @@ where
     .map_err(|error| format!("failed to create rejection audit record: {error}"))?;
 
     audit_writer(&record).map_err(|error| format!("failed to persist rejection audit: {error}"))
+}
+
+fn write_reconciliation_audit<F>(claimed: &PendingReview, mut audit_writer: F) -> Result<(), String>
+where
+    F: FnMut(&AuditRecord<'_>) -> Result<(), String>,
+{
+    let reason = review_reason_for_request(&claimed.request)?;
+
+    let record = AuditRecord::new(
+        claimed.request_id,
+        &claimed.purpose,
+        PolicyDecision::Review,
+        reason,
+        AuditPhase::Reconciliation,
+        ExecutionOutcome::Unknown,
+    )
+    .map_err(|error| format!("failed to create reconciliation audit record: {error}"))?;
+
+    audit_writer(&record)
+        .map_err(|error| format!("failed to persist reconciliation audit: {error}"))
 }
 fn audit_claimed_rejection<F>(
     claimed: &PendingReview,
@@ -1180,6 +1210,36 @@ where
             })?;
 
             Ok(AdminOutcome::Rejected { pending })
+        }
+        AdminCommand::AcknowledgeClaimed { request_id } => {
+            let claimed = {
+                let store = pending_reviews
+                    .lock()
+                    .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+                store
+                    .get_claimed(&request_id)
+                    .cloned()
+                    .ok_or_else(|| "claimed review request not found".to_owned())?
+            };
+
+            write_reconciliation_audit(&claimed, |record| persist_audit(audit_log_path, record))?;
+
+            let acknowledged = {
+                let mut store = pending_reviews
+                    .lock()
+                    .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+                store.consume_claimed(&request_id).map_err(|error| {
+            format!(
+                "reconciliation audit succeeded but failed to consume claimed request: {error}"
+            )
+        })?
+            };
+
+            Ok(AdminOutcome::ClaimedAcknowledged {
+                pending: acknowledged,
+            })
         }
     }
 }
@@ -1742,19 +1802,20 @@ mod gateway_tests {
     use super::{
         AddArguments, AdminCommand, AdminOutcome, AdminSocketPathGuard, AuditPhase, ExecuteParams,
         ExecutionArgumentsParams, ExecutionContextParams, ExecutionOutcome, ExecutionRequest,
-        FileSystemCapability, GatewayConfig, HttpExecutionResult, HttpMethod,
-        MAX_ADMIN_COMMAND_LENGTH, MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation,
-        PolicyReason, ReadFileArguments, ReviewedExecutionOutcome, ReviewedOperationResult,
-        WriteFileArguments, audit_claimed_approval, build_execution_request, create_admin_listener,
+        GatewayConfig, HttpExecutionResult, HttpMethod, MAX_ADMIN_COMMAND_LENGTH,
+        MAX_MESSAGE_LENGTH, PolicyDecision, PolicyEvaluation, PolicyReason, ReadFileArguments,
+        ReviewedExecutionOutcome, ReviewedOperationResult, WriteFileArguments,
+        audit_claimed_approval, build_execution_request, create_admin_listener,
         create_managed_admin_listener, evaluate_request, evaluate_request_with_config,
         execute_http_post_with_config, execute_message_with_audit_id, execute_request,
         execute_request_with_http_runner, handle_admin_command,
         handle_admin_command_with_http_runner, handle_admin_connection, parse_admin_command,
         reject_pending_request, remove_test_audit_log, revalidate_pending_request,
         review_reason_for_request, run_infinite_loop_with_fuel, stop_admin_task,
-        test_audit_log_path,
+        test_audit_log_path, write_reconciliation_audit,
     };
     use crate::execution::HttpRequestArguments;
+    use crate::filesystem::{FileSystemCapability, WriteTargetState};
     use crate::pending_review::{PendingReview, PendingReviewStore};
     use crate::policy::evaluate_message;
     use std::path::PathBuf;
@@ -5779,6 +5840,258 @@ mod tests {
             result,
             Err("pending review state file must not be a symbolic link".to_owned())
         );
+
+        Ok(())
+    }
+    #[test]
+    fn parses_acknowledge_claimed_admin_command() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let command = parse_admin_command(&format!("ACK_CLAIMED {request_id}"))?;
+
+        assert_eq!(command, AdminCommand::AcknowledgeClaimed { request_id });
+
+        Ok(())
+    }
+    #[test]
+    fn acknowledge_claimed_records_reconciliation_and_consumes_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Reconcile uncertain write".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+            store.claim(&request_id)?;
+        }
+
+        let mut audited_phase = None;
+        let mut audited_outcome = None;
+
+        let claimed = {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store
+                .get_claimed(&request_id)
+                .cloned()
+                .ok_or_else(|| "expected claimed review".to_owned())?
+        };
+
+        write_reconciliation_audit(&claimed, |record| {
+            audited_phase = Some(record.phase);
+            audited_outcome = Some(record.execution_outcome);
+            Ok(())
+        })?;
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            let acknowledged = store.consume_claimed(&request_id)?;
+
+            assert_eq!(acknowledged, pending);
+            assert!(store.get_claimed(&request_id).is_none());
+        }
+
+        assert_eq!(audited_phase, Some(AuditPhase::Reconciliation));
+        assert_eq!(audited_outcome, Some(ExecutionOutcome::Unknown));
+
+        Ok(())
+    }
+    #[test]
+    fn acknowledge_claimed_admin_command_consumes_without_execution() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new(
+            request_id,
+            ExecutionRequest::HttpRequest(HttpRequestArguments {
+                method: HttpMethod::Post,
+                url: "https://api.example.com/items".to_owned(),
+                body: Some(r#"{"value":"test"}"#.to_owned()),
+            }),
+            "Reconcile uncertain HTTP POST".to_owned(),
+        );
+
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+            store.claim(&request_id)?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
+
+        let outcome = handle_admin_command_with_http_runner(
+            AdminCommand::AcknowledgeClaimed { request_id },
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+            |_arguments| Err("HTTP runner must not execute during reconciliation".to_owned()),
+        )?;
+
+        assert_eq!(
+            outcome,
+            AdminOutcome::ClaimedAcknowledged {
+                pending: pending.clone()
+            }
+        );
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert!(store.get_claimed(&request_id).is_none());
+            assert!(store.get(&request_id).is_none());
+        }
+
+        let audit_contents = std::fs::read_to_string(&audit_log_path)
+            .map_err(|error| format!("failed to read reconciliation audit log: {error}"))?;
+
+        assert!(audit_contents.contains("\"phase\":\"Reconciliation\""));
+        assert!(audit_contents.contains("\"execution_outcome\":\"Unknown\""));
+        assert!(audit_contents.contains(&request_id.to_string()));
+
+        remove_test_audit_log(&audit_log_path);
+
+        Ok(())
+    }
+    #[test]
+    fn reconciliation_audit_failure_keeps_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Reconcile uncertain write".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+            store.claim(&request_id)?;
+        }
+
+        let claimed = {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store
+                .get_claimed(&request_id)
+                .cloned()
+                .ok_or_else(|| "expected claimed review".to_owned())?
+        };
+
+        let result = write_reconciliation_audit(&claimed, |_| {
+            Err("simulated reconciliation audit failure".to_owned())
+        });
+
+        assert_eq!(
+            result,
+            Err(
+                "failed to persist reconciliation audit: simulated reconciliation audit failure"
+                    .to_owned()
+            )
+        );
+
+        let store = pending_reviews
+            .lock()
+            .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+        assert_eq!(store.get_claimed(&request_id), Some(&pending));
+
+        Ok(())
+    }
+    #[test]
+    fn acknowledge_claimed_keeps_request_when_audit_persistence_fails() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Reconcile uncertain write".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        let pending_reviews = empty_pending_review_store();
+
+        {
+            let mut store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            store.insert(pending.clone())?;
+            store.claim(&request_id)?;
+        }
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
+
+        let invalid_audit_path = std::env::temp_dir().join(format!(
+            "zyguor-reconciliation-audit-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&invalid_audit_path)
+            .map_err(|error| format!("failed to create audit test directory: {error}"))?;
+
+        let result = handle_admin_command_with_http_runner(
+            AdminCommand::AcknowledgeClaimed { request_id },
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &invalid_audit_path,
+            |_arguments| Err("operation must not execute during reconciliation".to_owned()),
+        );
+
+        assert!(result.is_err());
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert_eq!(store.get_claimed(&request_id), Some(&pending));
+        }
+
+        std::fs::remove_dir_all(&invalid_audit_path)
+            .map_err(|error| format!("failed to remove audit test directory: {error}"))?;
 
         Ok(())
     }

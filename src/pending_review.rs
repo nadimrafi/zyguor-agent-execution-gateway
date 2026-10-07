@@ -222,7 +222,6 @@ impl PendingReviewStore {
         }
     }
 
-    #[cfg(test)]
     pub fn get_claimed(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.claimed_reviews.get(request_id)
     }

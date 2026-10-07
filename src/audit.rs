@@ -10,6 +10,7 @@ pub enum AuditPhase {
     Rejection,
     PreExecution,
     Completion,
+    Reconciliation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -17,6 +18,7 @@ pub enum ExecutionOutcome {
     Success,
     Failed,
     NotExecuted,
+    Unknown,
 }
 
 #[derive(Debug, serde::Serialize)]
