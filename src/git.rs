@@ -1,4 +1,15 @@
 use std::path::Path;
+const MAX_GIT_STATUS_ENTRIES: usize = 10_000;
+
+fn ensure_status_entry_capacity(current_count: usize, maximum: usize) -> Result<(), String> {
+    if current_count >= maximum {
+        return Err(format!(
+            "Git status exceeds maximum entry count of {maximum}"
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GitStatusResult {
@@ -61,6 +72,7 @@ pub fn read_git_status(repository_path: &Path) -> Result<GitStatusResult, String
     let mut entries = Vec::new();
 
     for entry in statuses.iter() {
+        ensure_status_entry_capacity(entries.len(), MAX_GIT_STATUS_ENTRIES)?;
         let path = entry
             .path()
             .map_err(|error| format!("failed to read Git status path: {error}"))?;
@@ -188,5 +200,19 @@ mod tests {
             .map_err(|error| format!("failed to remove test directories: {error}"))?;
 
         Ok(())
+    }
+    #[test]
+    fn accepts_git_status_entry_below_limit() -> Result<(), String> {
+        super::ensure_status_entry_capacity(9_999, 10_000)
+    }
+
+    #[test]
+    fn rejects_git_status_entry_at_limit() {
+        let result = super::ensure_status_entry_capacity(10_000, 10_000);
+
+        assert_eq!(
+            result,
+            Err("Git status exceeds maximum entry count of 10000".to_owned())
+        );
     }
 }
