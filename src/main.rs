@@ -24,7 +24,7 @@ use filesystem::FileSystemCapability;
 use git::read_git_status;
 use http::{ValidatedHttpUrl, validate_http_destination};
 use http_execution::{HttpExecutionResult, HttpExecutor};
-use pending_review::{PendingReview, PendingReviewStore};
+use pending_review::{ConsumeClaimedFailure, PendingReview, PendingReviewStore};
 use policy::{
     PolicyDecision, PolicyEvaluation, PolicyOperation, PolicyReason, block_out_of_scope,
     evaluate_operation_with_config,
@@ -161,6 +161,10 @@ enum AdminOutcome {
     ClaimedAcknowledged {
         pending: PendingReview,
     },
+    ClaimedAcknowledgementDurabilityUncertain {
+        request_id: uuid::Uuid,
+        error: String,
+    },
     WriteFailed {
         request_id: uuid::Uuid,
         error: String,
@@ -212,6 +216,9 @@ fn format_admin_outcome_response(outcome: &AdminOutcome) -> String {
         }
         AdminOutcome::ClaimedAcknowledged { pending } => {
             format!("OK CLAIMED_ACKNOWLEDGED {}\n", pending.request_id)
+        }
+        AdminOutcome::ClaimedAcknowledgementDurabilityUncertain { request_id, error } => {
+            format!("ERROR CLAIMED_ACKNOWLEDGEMENT_DURABILITY_UNCERTAIN {request_id} {error}\n")
         }
         AdminOutcome::CargoTestCompleted { request_id, result } => {
             match serde_json::to_string(result) {
@@ -643,12 +650,12 @@ fn restore_claimed_request(
 fn consume_claimed_request(
     request_id: Uuid,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
-) -> Result<PendingReview, String> {
-    let mut store = pending_reviews
-        .lock()
-        .map_err(|_| "pending review store lock poisoned".to_owned())?;
+) -> Result<PendingReview, ConsumeClaimedFailure> {
+    let mut store = pending_reviews.lock().map_err(|_| {
+        ConsumeClaimedFailure::NotCommitted("pending review store lock poisoned".to_owned())
+    })?;
 
-    store.consume_claimed(&request_id)
+    store.consume_claimed_classified(&request_id)
 }
 fn review_reason_for_request(request: &ExecutionRequest) -> Result<PolicyReason, String> {
     match request {
@@ -1229,21 +1236,22 @@ where
                 persist_audit_locked(audit_lock, audit_log_path, record)
             })?;
 
-            let acknowledged = {
-                let mut store = pending_reviews
-                    .lock()
-                    .map_err(|_| "pending review store lock poisoned".to_owned())?;
+            match consume_claimed_request(request_id, pending_reviews) {
+                Ok(acknowledged) => Ok(AdminOutcome::ClaimedAcknowledged {
+                    pending: acknowledged,
+                }),
 
-                store.consume_claimed(&request_id).map_err(|error| {
-            format!(
-                "reconciliation audit succeeded but failed to consume claimed request: {error}"
-            )
-        })?
-            };
+                Err(ConsumeClaimedFailure::NotCommitted(error)) => Err(format!(
+                    "reconciliation audit succeeded but claimed request was not consumed: {error}"
+                )),
 
-            Ok(AdminOutcome::ClaimedAcknowledged {
-                pending: acknowledged,
-            })
+                Err(ConsumeClaimedFailure::DurabilityUncertain(error)) => {
+                    Ok(AdminOutcome::ClaimedAcknowledgementDurabilityUncertain {
+                        request_id,
+                        error,
+                    })
+                }
+            }
         }
     }
 }
@@ -5964,6 +5972,89 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn reconciliation_before_commit_failure_keeps_claimed_request() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-reconciliation-before-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create reconciliation test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Reconcile uncertain write".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.insert(pending.clone())?;
+        store.claim(&request_id)?;
+
+        store.set_persistence_test_fault(Some(
+            crate::pending_review::PersistenceTestFault::BeforeCommit,
+        ));
+
+        let pending_reviews = Arc::new(Mutex::new(store));
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
+
+        let result = handle_admin_command_with_http_runner(
+            AdminCommand::AcknowledgeClaimed { request_id },
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+            &audit_lock,
+            |_arguments| Err("operation must not execute during reconciliation".to_owned()),
+        );
+
+        let error =
+            result.expect_err("pre-commit reconciliation consume failure should be reported");
+
+        assert!(
+            error.contains("claimed request was not consumed"),
+            "unexpected reconciliation error: {error}"
+        );
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert_eq!(store.get_claimed(&request_id), Some(&pending));
+        }
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert_eq!(restored.get_claimed(&request_id), Some(&pending));
+
+        let audit_contents = std::fs::read_to_string(&audit_log_path)
+            .map_err(|error| format!("failed to read reconciliation audit log: {error}"))?;
+
+        assert!(audit_contents.contains("\"phase\":\"Reconciliation\""));
+        assert!(audit_contents.contains(&request_id.to_string()));
+
+        remove_test_audit_log(&audit_log_path);
+
+        std::fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to remove reconciliation test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
     fn acknowledge_claimed_admin_command_consumes_without_execution() -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4();
 
@@ -6083,6 +6174,100 @@ mod tests {
             .map_err(|_| "pending review store lock poisoned".to_owned())?;
 
         assert_eq!(store.get_claimed(&request_id), Some(&pending));
+
+        Ok(())
+    }
+    #[test]
+    fn reconciliation_after_commit_failure_reports_durability_uncertain() -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4();
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-reconciliation-after-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create reconciliation test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Reconcile uncertain write".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.insert(pending.clone())?;
+        store.claim(&request_id)?;
+
+        store.set_persistence_test_fault(Some(
+            crate::pending_review::PersistenceTestFault::AfterCommit,
+        ));
+
+        let pending_reviews = Arc::new(Mutex::new(store));
+
+        let filesystem = FileSystemCapability::new(std::env::temp_dir());
+        let config = GatewayConfig::default();
+        let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
+
+        let outcome = handle_admin_command_with_http_runner(
+            AdminCommand::AcknowledgeClaimed { request_id },
+            &pending_reviews,
+            &filesystem,
+            &config,
+            &audit_log_path,
+            &audit_lock,
+            |_arguments| Err("operation must not execute during reconciliation".to_owned()),
+        )?;
+
+        let AdminOutcome::ClaimedAcknowledgementDurabilityUncertain {
+            request_id: outcome_request_id,
+            error,
+        } = outcome
+        else {
+            return Err("expected durability-uncertain acknowledgement outcome".to_owned());
+        };
+
+        assert_eq!(outcome_request_id, request_id);
+
+        assert!(
+            error.contains("durability is uncertain"),
+            "unexpected durability error: {error}"
+        );
+
+        {
+            let store = pending_reviews
+                .lock()
+                .map_err(|_| "pending review store lock poisoned".to_owned())?;
+
+            assert!(store.get_claimed(&request_id).is_none());
+            assert!(store.get(&request_id).is_none());
+        }
+
+        let response = super::format_admin_outcome_response(
+            &AdminOutcome::ClaimedAcknowledgementDurabilityUncertain {
+                request_id,
+                error: error.clone(),
+            },
+        );
+
+        assert!(response.starts_with(&format!(
+            "ERROR CLAIMED_ACKNOWLEDGEMENT_DURABILITY_UNCERTAIN {request_id} "
+        )));
+
+        assert!(response.contains("durability is uncertain"));
+
+        remove_test_audit_log(&audit_log_path);
+
+        std::fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to remove reconciliation test directory: {error}"))?;
 
         Ok(())
     }

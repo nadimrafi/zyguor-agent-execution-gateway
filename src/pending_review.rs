@@ -204,14 +204,31 @@ impl PersistedPendingReviewState {
 }
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistenceTestFault {
+pub(crate) enum PersistenceTestFault {
     BeforeCommit,
     AfterCommit,
 }
+
 #[derive(Debug)]
 enum PersistenceFailure {
     BeforeCommit(String),
     AfterCommit(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConsumeClaimedFailure {
+    NotCommitted(String),
+    DurabilityUncertain(String),
+}
+
+impl std::fmt::Display for ConsumeClaimedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(message) | Self::DurabilityUncertain(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
 }
 #[cfg(test)]
 impl PersistenceFailure {
@@ -252,6 +269,39 @@ impl PendingReviewStore {
             None => Ok(()),
         }
     }
+    pub(crate) fn consume_claimed_classified(
+        &mut self,
+        request_id: &Uuid,
+    ) -> Result<PendingReview, ConsumeClaimedFailure> {
+        let claimed = self.claimed_reviews.remove(request_id).ok_or_else(|| {
+            ConsumeClaimedFailure::NotCommitted("claimed review request not found".to_owned())
+        })?;
+
+        if let Err(error) = self.persist() {
+            match error {
+                PersistenceFailure::BeforeCommit(message) => {
+                    self.claimed_reviews.insert(*request_id, claimed.clone());
+
+                    return Err(ConsumeClaimedFailure::NotCommitted(format!(
+                        "failed to persist consumed claimed review: {message}"
+                    )));
+                }
+
+                PersistenceFailure::AfterCommit(message) => {
+                    return Err(ConsumeClaimedFailure::DurabilityUncertain(format!(
+                        "claimed review was consumed but persistence durability is uncertain: {message}"
+                    )));
+                }
+            }
+        }
+
+        Ok(claimed)
+    }
+    #[cfg(test)]
+    pub(crate) fn consume_claimed(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
+        self.consume_claimed_classified(request_id)
+            .map_err(|error| error.to_string())
+    }
 
     pub fn get_claimed(&self, request_id: &Uuid) -> Option<&PendingReview> {
         self.claimed_reviews.get(request_id)
@@ -260,7 +310,7 @@ impl PendingReviewStore {
         self.claimed_reviews.len()
     }
     #[cfg(test)]
-    fn set_persistence_test_fault(&mut self, fault: Option<PersistenceTestFault>) {
+    pub(crate) fn set_persistence_test_fault(&mut self, fault: Option<PersistenceTestFault>) {
         self.persistence_test_fault = fault;
     }
 
@@ -286,25 +336,6 @@ impl PendingReviewStore {
 
         serde_json::to_string_pretty(&state)
             .map_err(|error| format!("failed to serialize pending review state: {error}"))
-    }
-
-    pub fn consume_claimed(&mut self, request_id: &Uuid) -> Result<PendingReview, String> {
-        let claimed = self
-            .claimed_reviews
-            .remove(request_id)
-            .ok_or_else(|| "claimed review request not found".to_owned())?;
-
-        if let Err(error) = self.persist() {
-            if matches!(&error, PersistenceFailure::BeforeCommit(_)) {
-                self.claimed_reviews.insert(*request_id, claimed.clone());
-            }
-
-            return Err(format!(
-                "failed to persist consumed claimed review: {error}"
-            ));
-        }
-
-        Ok(claimed)
     }
 
     pub fn from_serialized_state(input: &str) -> Result<Self, String> {
@@ -587,7 +618,10 @@ impl PendingReviewStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingReview, PendingReviewStore, PersistenceFailure, PersistenceTestFault};
+    use super::{
+        ConsumeClaimedFailure, PendingReview, PendingReviewStore, PersistenceFailure,
+        PersistenceTestFault,
+    };
     use crate::execution::{ExecutionRequest, WriteFileArguments};
     use crate::filesystem::WriteTargetState;
 
@@ -1080,6 +1114,116 @@ mod tests {
 
         // No committed state file should exist.
         assert!(!state_path.exists());
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn before_commit_consume_failure_keeps_claimed_request() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-before-commit-consume-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.insert(pending.clone())?;
+        store.claim(&request_id)?;
+
+        store.set_persistence_test_fault(Some(PersistenceTestFault::BeforeCommit));
+
+        let result = store.consume_claimed_classified(&request_id);
+
+        let error = result.expect_err("injected pre-commit consume failure should be reported");
+
+        assert!(
+            matches!(error, ConsumeClaimedFailure::NotCommitted(_)),
+            "expected NotCommitted consume failure, got: {error:?}"
+        );
+
+        assert_eq!(store.get_claimed(&request_id), Some(&pending));
+
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert_eq!(restored.get_claimed(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn after_commit_consume_failure_reports_durability_uncertain() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-after-commit-consume-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.insert(pending)?;
+        store.claim(&request_id)?;
+
+        store.set_persistence_test_fault(Some(PersistenceTestFault::AfterCommit));
+
+        let result = store.consume_claimed_classified(&request_id);
+
+        let error = result.expect_err("injected post-commit consume failure should be reported");
+
+        assert!(
+            matches!(error, ConsumeClaimedFailure::DurabilityUncertain(_)),
+            "expected DurabilityUncertain consume failure, got: {error:?}"
+        );
+
+        // The rename already crossed the commit boundary, so the running
+        // process must not restore the claimed request.
+        assert!(store.get_claimed(&request_id).is_none());
+        assert!(store.get(&request_id).is_none());
+
+        // The renamed disk state should also reflect the consumed request.
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert!(restored.get_claimed(&request_id).is_none());
+        assert!(restored.get(&request_id).is_none());
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
