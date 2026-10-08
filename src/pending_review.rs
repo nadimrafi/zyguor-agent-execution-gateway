@@ -202,12 +202,43 @@ impl TryFrom<PersistedPendingReview> for PendingReview {
 impl PersistedPendingReviewState {
     const VERSION: u32 = 3;
 }
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceTestFault {
+    BeforeCommit,
+    AfterCommit,
+}
+#[derive(Debug)]
+enum PersistenceFailure {
+    BeforeCommit(String),
+    AfterCommit(String),
+}
+#[cfg(test)]
+impl PersistenceFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::BeforeCommit(message) | Self::AfterCommit(message) => message,
+        }
+    }
+}
+impl std::fmt::Display for PersistenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCommit(message) | Self::AfterCommit(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PendingReviewStore {
     reviews: HashMap<Uuid, PendingReview>,
     claimed_reviews: HashMap<Uuid, PendingReview>,
     persistence_path: Option<PathBuf>,
+
+    #[cfg(test)]
+    persistence_test_fault: Option<PersistenceTestFault>,
 }
 
 impl PendingReviewStore {
@@ -215,9 +246,9 @@ impl PendingReviewStore {
         Self::default()
     }
 
-    fn persist(&self) -> Result<(), String> {
+    fn persist(&self) -> Result<(), PersistenceFailure> {
         match &self.persistence_path {
-            Some(path) => self.save_to_path(path),
+            Some(path) => self.save_to_path_classified(path),
             None => Ok(()),
         }
     }
@@ -227,6 +258,10 @@ impl PendingReviewStore {
     }
     pub fn claimed_count(&self) -> usize {
         self.claimed_reviews.len()
+    }
+    #[cfg(test)]
+    fn set_persistence_test_fault(&mut self, fault: Option<PersistenceTestFault>) {
+        self.persistence_test_fault = fault;
     }
 
     pub fn serialize_state(&self) -> Result<String, String> {
@@ -260,7 +295,9 @@ impl PendingReviewStore {
             .ok_or_else(|| "claimed review request not found".to_owned())?;
 
         if let Err(error) = self.persist() {
-            self.claimed_reviews.insert(*request_id, claimed.clone());
+            if matches!(&error, PersistenceFailure::BeforeCommit(_)) {
+                self.claimed_reviews.insert(*request_id, claimed.clone());
+            }
 
             return Err(format!(
                 "failed to persist consumed claimed review: {error}"
@@ -327,15 +364,22 @@ impl PendingReviewStore {
         Ok(store)
     }
 
-    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        let serialized = self.serialize_state()?;
+    fn save_to_path_classified(&self, path: &Path) -> Result<(), PersistenceFailure> {
+        let serialized = self
+            .serialize_state()
+            .map_err(PersistenceFailure::BeforeCommit)?;
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
+        let parent = path.parent().ok_or_else(|| {
+            PersistenceFailure::BeforeCommit(
+                "pending review state path must have a parent directory".to_owned(),
+            )
+        })?;
 
-        path.file_name()
-            .ok_or_else(|| "pending review state path must include a file name".to_owned())?;
+        path.file_name().ok_or_else(|| {
+            PersistenceFailure::BeforeCommit(
+                "pending review state path must include a file name".to_owned(),
+            )
+        })?;
 
         let temporary_path = parent.join(format!(".zyguor-pending-reviews-{}.tmp", Uuid::new_v4()));
 
@@ -345,23 +389,66 @@ impl PendingReviewStore {
         #[cfg(unix)]
         options.mode(0o600);
 
-        let save_result = (|| -> Result<(), String> {
+        let save_result = (|| -> Result<(), PersistenceFailure> {
             let mut temporary_file = options.open(&temporary_path).map_err(|error| {
-                format!("failed to create temporary pending review state file: {error}")
+                PersistenceFailure::BeforeCommit(format!(
+                    "failed to create temporary pending review state file: {error}"
+                ))
             })?;
 
             temporary_file
                 .write_all(serialized.as_bytes())
-                .map_err(|error| format!("failed to write pending review state file: {error}"))?;
+                .map_err(|error| {
+                    PersistenceFailure::BeforeCommit(format!(
+                        "failed to write pending review state file: {error}"
+                    ))
+                })?;
 
-            temporary_file
-                .sync_all()
-                .map_err(|error| format!("failed to sync pending review state file: {error}"))?;
+            temporary_file.sync_all().map_err(|error| {
+                PersistenceFailure::BeforeCommit(format!(
+                    "failed to sync pending review state file: {error}"
+                ))
+            })?;
 
             drop(temporary_file);
 
+            #[cfg(unix)]
+            let parent_directory = std::fs::File::open(parent).map_err(|error| {
+                PersistenceFailure::BeforeCommit(format!(
+                    "failed to open pending review state parent directory for sync: {error}"
+                ))
+            })?;
+            #[cfg(test)]
+            if matches!(
+                self.persistence_test_fault,
+                Some(PersistenceTestFault::BeforeCommit)
+            ) {
+                return Err(PersistenceFailure::BeforeCommit(
+                    "injected pre-commit persistence failure".to_owned(),
+                ));
+            }
+
             std::fs::rename(&temporary_path, path).map_err(|error| {
-                format!("failed to atomically replace pending review state file: {error}")
+                PersistenceFailure::BeforeCommit(format!(
+                    "failed to atomically replace pending review state file: {error}"
+                ))
+            })?;
+
+            #[cfg(test)]
+            if matches!(
+                self.persistence_test_fault,
+                Some(PersistenceTestFault::AfterCommit)
+            ) {
+                return Err(PersistenceFailure::AfterCommit(
+                    "injected post-commit persistence failure".to_owned(),
+                ));
+            }
+
+            #[cfg(unix)]
+            parent_directory.sync_all().map_err(|error| {
+                PersistenceFailure::AfterCommit(format!(
+                    "pending review state was replaced but parent directory sync failed: {error}"
+                ))
             })?;
 
             Ok(())
@@ -377,6 +464,11 @@ impl PendingReviewStore {
 
         save_result
     }
+    #[cfg(test)]
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        self.save_to_path_classified(path)
+            .map_err(PersistenceFailure::into_message)
+    }
 
     pub fn insert(&mut self, pending: PendingReview) -> Result<(), String> {
         if self.reviews.contains_key(&pending.request_id) {
@@ -388,7 +480,9 @@ impl PendingReviewStore {
         self.reviews.insert(request_id, pending);
 
         if let Err(error) = self.persist() {
-            self.reviews.remove(&request_id);
+            if matches!(&error, PersistenceFailure::BeforeCommit(_)) {
+                self.reviews.remove(&request_id);
+            }
 
             return Err(format!(
                 "failed to persist pending review insertion: {error}"
@@ -407,13 +501,14 @@ impl PendingReviewStore {
         }
 
         if let Err(error) = self.persist() {
-            if let Some(pending) = removed.clone() {
+            if matches!(&error, PersistenceFailure::BeforeCommit(_))
+                && let Some(pending) = removed.clone()
+            {
                 self.reviews.insert(*request_id, pending);
             }
 
             return Err(format!("failed to persist pending review removal: {error}"));
         }
-
         Ok(removed)
     }
 
@@ -434,8 +529,10 @@ impl PendingReviewStore {
         self.claimed_reviews.insert(*request_id, pending.clone());
 
         if let Err(error) = self.persist() {
-            self.claimed_reviews.remove(request_id);
-            self.reviews.insert(*request_id, pending);
+            if matches!(&error, PersistenceFailure::BeforeCommit(_)) {
+                self.claimed_reviews.remove(request_id);
+                self.reviews.insert(*request_id, pending);
+            }
 
             return Err(format!("failed to persist pending review claim: {error}"));
         }
@@ -464,8 +561,10 @@ impl PendingReviewStore {
         self.reviews.insert(request_id, pending.clone());
 
         if let Err(error) = self.persist() {
-            self.reviews.remove(&request_id);
-            self.claimed_reviews.insert(request_id, pending);
+            if matches!(&error, PersistenceFailure::BeforeCommit(_)) {
+                self.reviews.remove(&request_id);
+                self.claimed_reviews.insert(request_id, pending);
+            }
 
             return Err(format!(
                 "failed to persist restored pending review: {error}"
@@ -488,7 +587,7 @@ impl PendingReviewStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingReview, PendingReviewStore};
+    use super::{PendingReview, PendingReviewStore, PersistenceFailure, PersistenceTestFault};
     use crate::execution::{ExecutionRequest, WriteFileArguments};
     use crate::filesystem::WriteTargetState;
 
@@ -844,7 +943,7 @@ mod tests {
     fn memory_only_store_persist_is_no_op() -> Result<(), String> {
         let store = PendingReviewStore::new();
 
-        store.persist()?;
+        store.persist().map_err(PersistenceFailure::into_message)?;
 
         Ok(())
     }
@@ -881,6 +980,106 @@ mod tests {
         let restored = PendingReviewStore::load_from_path(&state_path)?;
 
         assert_eq!(restored.get(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn after_commit_insert_failure_keeps_memory_aligned_with_disk() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-after-commit-insert-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.set_persistence_test_fault(Some(PersistenceTestFault::AfterCommit));
+
+        let result = store.insert(pending.clone());
+
+        let error = result.expect_err("injected post-commit failure should be reported");
+
+        assert!(
+            error.contains("injected post-commit persistence failure"),
+            "unexpected persistence error: {error}"
+        );
+
+        // The rename already committed the new state, so memory must NOT roll back.
+        assert_eq!(store.get(&request_id), Some(&pending));
+
+        // The renamed state file must also contain the inserted review.
+        let restored = PendingReviewStore::load_from_path(&state_path)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn before_commit_insert_failure_rolls_memory_back() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-before-commit-insert-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let state_path = test_root.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Update application configuration".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.set_persistence_test_fault(Some(PersistenceTestFault::BeforeCommit));
+
+        let result = store.insert(pending);
+
+        let error = result.expect_err("injected pre-commit failure should be reported");
+
+        assert!(
+            error.contains("injected pre-commit persistence failure"),
+            "unexpected persistence error: {error}"
+        );
+
+        // The rename never happened, so memory must roll back.
+        assert!(store.get(&request_id).is_none());
+
+        // No committed state file should exist.
+        assert!(!state_path.exists());
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
