@@ -140,6 +140,7 @@ struct ZyguorGateway {
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     config: Arc<GatewayConfig>,
     audit_log_path: Arc<PathBuf>,
+    audit_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,6 +1047,7 @@ fn handle_admin_command_with_http_runner<H>(
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
     audit_log_path: &Path,
+    audit_lock: &Mutex<()>,
     http_post_runner: H,
 ) -> Result<AdminOutcome, String>
 where
@@ -1066,7 +1068,7 @@ where
             drop(store);
 
             audit_claimed_approval(&claimed, pending_reviews, |record| {
-                persist_audit(audit_log_path, record)
+                persist_audit_locked(audit_lock, audit_log_path, record)
             })?;
 
             match &claimed.request {
@@ -1074,7 +1076,7 @@ where
                     let outcome = execute_claimed_write(
                         &claimed,
                         pending_reviews,
-                        |record| persist_audit(audit_log_path, record),
+                        |record| persist_audit_locked(audit_lock, audit_log_path, record),
                         || filesystem.write_text_file(&arguments.path, &arguments.content),
                     )?;
                     match outcome {
@@ -1112,7 +1114,7 @@ where
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
-                        |record| persist_audit(audit_log_path, record),
+                        |record| persist_audit_locked(audit_lock, audit_log_path, record),
                         || execute_cargo_test_with_config(filesystem, config, expected_fingerprint),
                     )?;
 
@@ -1158,7 +1160,7 @@ where
                     let outcome = execute_claimed_reviewed_action(
                         &claimed,
                         pending_reviews,
-                        |record| persist_audit(audit_log_path, record),
+                        |record| persist_audit_locked(audit_lock, audit_log_path, record),
                         || http_post_runner(arguments),
                     )?;
 
@@ -1206,7 +1208,7 @@ where
             let pending = reject_pending_request(request_id, pending_reviews)?;
 
             audit_claimed_rejection(&pending, pending_reviews, |record| {
-                persist_audit(audit_log_path, record)
+                persist_audit_locked(audit_lock, audit_log_path, record)
             })?;
 
             Ok(AdminOutcome::Rejected { pending })
@@ -1223,7 +1225,9 @@ where
                     .ok_or_else(|| "claimed review request not found".to_owned())?
             };
 
-            write_reconciliation_audit(&claimed, |record| persist_audit(audit_log_path, record))?;
+            write_reconciliation_audit(&claimed, |record| {
+                persist_audit_locked(audit_lock, audit_log_path, record)
+            })?;
 
             let acknowledged = {
                 let mut store = pending_reviews
@@ -1243,12 +1247,14 @@ where
         }
     }
 }
+
 fn handle_admin_command_with_config(
     command: AdminCommand,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
     audit_log_path: &Path,
+    audit_lock: &Mutex<()>,
 ) -> Result<AdminOutcome, String> {
     handle_admin_command_with_http_runner(
         command,
@@ -1256,6 +1262,7 @@ fn handle_admin_command_with_config(
         filesystem,
         config,
         audit_log_path,
+        audit_lock,
         |arguments| execute_http_post_with_config(arguments, config),
     )
 }
@@ -1266,6 +1273,7 @@ fn execute_request_with_http_runner<H>(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
     audit_log_path: &Path,
+    audit_lock: &Mutex<()>,
     http_runner: H,
 ) -> Result<String, String>
 where
@@ -1324,7 +1332,7 @@ where
         request_id,
         &params.context.purpose,
         evaluation,
-        |record| persist_audit(audit_log_path, record),
+        |record| persist_audit_locked(audit_lock, audit_log_path, record),
         || match request {
             ExecutionRequest::HttpRequest(arguments) => match arguments.method {
                 HttpMethod::Get => {
@@ -1366,13 +1374,13 @@ where
         },
     )
 }
-
 fn execute_request_with_config(
     params: &ExecuteParams,
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
     audit_log_path: &Path,
+    audit_lock: &Mutex<()>,
 ) -> Result<String, String> {
     execute_request_with_http_runner(
         params,
@@ -1380,12 +1388,24 @@ fn execute_request_with_config(
         pending_reviews,
         config,
         audit_log_path,
+        audit_lock,
         |method, destination, body| {
             let executor = HttpExecutor::new(config.http.execution)?;
 
             executor.execute(method, destination, body)
         },
     )
+}
+fn persist_audit_locked(
+    audit_lock: &Mutex<()>,
+    audit_log_path: &Path,
+    record: &AuditRecord<'_>,
+) -> Result<(), String> {
+    let _guard = audit_lock
+        .lock()
+        .map_err(|_| "audit log lock poisoned".to_owned())?;
+
+    persist_audit(audit_log_path, record)
 }
 
 #[tool_router(server_handler)]
@@ -1400,6 +1420,7 @@ impl ZyguorGateway {
             &self.pending_reviews,
             self.config.as_ref(),
             self.audit_log_path.as_path(),
+            self.audit_lock.as_ref(),
         ) {
             Ok(result) => result,
             Err(error) => format!("GATEWAY_ERROR: {error}"),
@@ -1470,6 +1491,7 @@ async fn handle_admin_connection(
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
     audit_log_path: &Path,
+    audit_lock: &Mutex<()>,
 ) -> Result<AdminOutcome, String> {
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
@@ -1506,6 +1528,7 @@ async fn handle_admin_connection(
             filesystem,
             config,
             audit_log_path,
+            audit_lock,
         ),
         Err(error) => Err(error),
     };
@@ -1571,6 +1594,7 @@ async fn run_admin_listener(
     filesystem: FileSystemCapability,
     config: Arc<GatewayConfig>,
     audit_log_path: Arc<PathBuf>,
+    audit_lock: Arc<Mutex<()>>,
 ) -> Result<(), String> {
     loop {
         let (stream, _) = listener
@@ -1584,6 +1608,7 @@ async fn run_admin_listener(
             &filesystem,
             &config,
             audit_log_path.as_path(),
+            &audit_lock,
         )
         .await
         {
@@ -1666,6 +1691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let audit_log_path = Arc::new(audit_log_path);
+    let audit_lock = Arc::new(Mutex::new(()));
     let pending_review_store = PendingReviewStore::load_from_path(&pending_review_state_path)
         .map_err(|error| format!("failed to load pending review state: {error}"))?;
 
@@ -1687,6 +1713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_reviews: Arc::clone(&pending_reviews),
         config: Arc::clone(&config),
         audit_log_path: Arc::clone(&audit_log_path),
+        audit_lock: Arc::clone(&audit_lock),
     };
 
     let admin_task = tokio::spawn(run_admin_listener(
@@ -1695,6 +1722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         filesystem,
         Arc::clone(&config),
         Arc::clone(&audit_log_path),
+        Arc::clone(&audit_lock),
     ));
 
     let gateway_result = async {
@@ -1761,12 +1789,15 @@ fn handle_admin_command(
 
     let audit_log_path = test_audit_log_path();
 
+    let audit_lock = Mutex::new(());
+
     let result = handle_admin_command_with_config(
         command,
         pending_reviews,
         filesystem,
         &config,
         &audit_log_path,
+        &audit_lock,
     );
 
     remove_test_audit_log(&audit_log_path);
@@ -1782,6 +1813,7 @@ fn execute_request(
     let config = GatewayConfig::default();
 
     let audit_log_path = test_audit_log_path();
+    let audit_lock = Mutex::new(());
 
     let result = execute_request_with_config(
         params,
@@ -1789,6 +1821,7 @@ fn execute_request(
         pending_reviews,
         &config,
         &audit_log_path,
+        &audit_lock,
     );
 
     remove_test_audit_log(&audit_log_path);
@@ -1927,6 +1960,7 @@ mod gateway_tests {
         let config = GatewayConfig::default();
 
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
 
         let rejected = handle_admin_connection(
             stream,
@@ -1934,6 +1968,7 @@ mod gateway_tests {
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
         )
         .await?;
 
@@ -2067,12 +2102,14 @@ mod gateway_tests {
 
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
         let outcome = handle_admin_connection(
             stream,
             &pending_reviews,
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
         )
         .await?;
         remove_test_audit_log(&audit_log_path);
@@ -2504,6 +2541,7 @@ mod gateway_tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
 
         let result = handle_admin_connection(
             stream,
@@ -2511,6 +2549,7 @@ mod gateway_tests {
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
         )
         .await;
 
@@ -2583,6 +2622,7 @@ mod gateway_tests {
         let config = GatewayConfig::default();
 
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
 
         let result = handle_admin_connection(
             stream,
@@ -2590,6 +2630,7 @@ mod gateway_tests {
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
         )
         .await;
 
@@ -2654,13 +2695,14 @@ mod gateway_tests {
         let config = GatewayConfig::default();
 
         let audit_log_path = test_audit_log_path();
-
+        let audit_lock = Mutex::new(());
         let result = handle_admin_connection(
             stream,
             &pending_reviews,
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
         )
         .await;
 
@@ -4412,6 +4454,7 @@ mod tests {
 
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
 
         let result = execute_request_with_http_runner(
             &params,
@@ -4419,6 +4462,7 @@ mod tests {
             &pending_reviews,
             &config,
             &audit_log_path,
+            &audit_lock,
             |method, destination, body| {
                 assert_eq!(method, HttpMethod::Get);
                 assert_eq!(
@@ -4906,12 +4950,14 @@ mod tests {
 
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
             |arguments| {
                 assert_eq!(arguments.method, HttpMethod::Post);
                 assert_eq!(arguments.url, "https://api.example.com/items");
@@ -4981,12 +5027,14 @@ mod tests {
 
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
             |_arguments| {
                 let result = HttpExecutionResult {
                     status_code: 500,
@@ -5044,13 +5092,14 @@ mod tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
-
+        let audit_lock = Mutex::new(());
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::Approve { request_id },
             &pending_reviews,
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
             |_arguments| Err("HTTP request failed: simulated transport failure".to_owned()),
         )?;
         remove_test_audit_log(&audit_log_path);
@@ -5942,6 +5991,7 @@ mod tests {
         let filesystem = FileSystemCapability::new(std::env::temp_dir());
         let config = GatewayConfig::default();
         let audit_log_path = test_audit_log_path();
+        let audit_lock = Mutex::new(());
 
         let outcome = handle_admin_command_with_http_runner(
             AdminCommand::AcknowledgeClaimed { request_id },
@@ -5949,6 +5999,7 @@ mod tests {
             &filesystem,
             &config,
             &audit_log_path,
+            &audit_lock,
             |_arguments| Err("HTTP runner must not execute during reconciliation".to_owned()),
         )?;
 
@@ -6071,12 +6122,14 @@ mod tests {
         std::fs::create_dir_all(&invalid_audit_path)
             .map_err(|error| format!("failed to create audit test directory: {error}"))?;
 
+        let audit_lock = Mutex::new(());
         let result = handle_admin_command_with_http_runner(
             AdminCommand::AcknowledgeClaimed { request_id },
             &pending_reviews,
             &filesystem,
             &config,
             &invalid_audit_path,
+            &audit_lock,
             |_arguments| Err("operation must not execute during reconciliation".to_owned()),
         );
 
@@ -6092,6 +6145,90 @@ mod tests {
 
         std::fs::remove_dir_all(&invalid_audit_path)
             .map_err(|error| format!("failed to remove audit test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn shared_audit_lock_preserves_concurrent_jsonl_records() -> Result<(), String> {
+        use crate::audit::{AuditPhase, AuditRecord, ExecutionOutcome};
+        use crate::policy::{PolicyDecision, PolicyReason};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        const WRITERS: usize = 8;
+        const RECORDS_PER_WRITER: usize = 10;
+
+        let audit_path = test_audit_log_path();
+        let audit_lock = Arc::new(Mutex::new(()));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let mut handles = Vec::new();
+
+        for writer_index in 0..WRITERS {
+            let audit_path = audit_path.clone();
+            let audit_lock = Arc::clone(&audit_lock);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || -> Result<(), String> {
+                barrier.wait();
+
+                for record_index in 0..RECORDS_PER_WRITER {
+                    let request_id = uuid::Uuid::new_v4();
+                    let purpose =
+                        format!("concurrent audit writer {writer_index} record {record_index}");
+
+                    let record = AuditRecord::new(
+                        request_id,
+                        &purpose,
+                        PolicyDecision::Allow,
+                        PolicyReason::Safe,
+                        AuditPhase::Completion,
+                        ExecutionOutcome::Success,
+                    )
+                    .map_err(|error| format!("failed to create audit record: {error}"))?;
+
+                    super::persist_audit_locked(audit_lock.as_ref(), &audit_path, &record)?;
+                }
+
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "audit writer thread panicked".to_owned())??;
+        }
+
+        let contents = std::fs::read_to_string(&audit_path)
+            .map_err(|error| format!("failed to read concurrent audit log: {error}"))?;
+
+        let lines: Vec<&str> = contents.lines().collect();
+        let expected_records = WRITERS * RECORDS_PER_WRITER;
+
+        assert_eq!(lines.len(), expected_records);
+
+        let mut request_ids = HashSet::new();
+
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|error| format!("audit line was not valid JSON: {error}"))?;
+
+            let request_id = value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "audit record is missing request_id".to_owned())?;
+
+            assert!(
+                request_ids.insert(request_id.to_owned()),
+                "duplicate request ID found in concurrent audit log"
+            );
+        }
+
+        assert_eq!(request_ids.len(), expected_records);
+
+        remove_test_audit_log(&audit_path);
 
         Ok(())
     }

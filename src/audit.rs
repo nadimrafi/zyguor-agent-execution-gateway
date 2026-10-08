@@ -65,23 +65,49 @@ pub fn write_audit<W: Write>(writer: &mut W, record: &AuditRecord<'_>) -> Result
 }
 
 pub fn persist_audit(audit_path: &std::path::Path, record: &AuditRecord<'_>) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    let mut create_options = OpenOptions::new();
+    create_options.append(true).create_new(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
+        create_options.mode(0o600);
+        create_options.custom_flags(libc::O_NOFOLLOW);
     }
 
-    let mut file = options.open(audit_path).map_err(|error| {
-        format!(
-            "failed to open audit log '{}': {error}",
-            audit_path.display()
-        )
-    })?;
+    let (mut file, newly_created) = match create_options.open(audit_path) {
+        Ok(file) => (file, true),
+
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing_options = OpenOptions::new();
+            existing_options.append(true);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                existing_options.custom_flags(libc::O_NOFOLLOW);
+            }
+
+            let file = existing_options.open(audit_path).map_err(|error| {
+                format!(
+                    "failed to open existing audit log '{}': {error}",
+                    audit_path.display()
+                )
+            })?;
+
+            (file, false)
+        }
+
+        Err(error) => {
+            return Err(format!(
+                "failed to create audit log '{}': {error}",
+                audit_path.display()
+            ));
+        }
+    };
+
     let metadata = file
         .metadata()
         .map_err(|error| format!("failed to inspect opened audit log: {error}"))?;
@@ -100,10 +126,41 @@ pub fn persist_audit(audit_path: &std::path::Path, record: &AuditRecord<'_>) -> 
             .map_err(|error| format!("failed to secure audit log permissions: {error}"))?;
     }
 
+    #[cfg(unix)]
+    if newly_created {
+        let parent = audit_path
+            .parent()
+            .ok_or_else(|| "audit log path must have a parent directory".to_owned())?;
+
+        let parent_directory = std::fs::File::open(parent)
+            .map_err(|error| format!("failed to open audit log parent directory: {error}"))?;
+
+        file.sync_all()
+            .map_err(|error| format!("failed to sync newly created audit log: {error}"))?;
+
+        parent_directory
+            .sync_all()
+            .map_err(|error| format!("failed to sync audit log parent directory: {error}"))?;
+    }
+
     write_audit(&mut file, record)?;
 
-    file.sync_data()
+    file.sync_all()
         .map_err(|error| format!("failed to sync audit log: {error}"))?;
+
+    #[cfg(unix)]
+    if newly_created {
+        let parent = audit_path
+            .parent()
+            .ok_or_else(|| "audit log path must have a parent directory".to_owned())?;
+
+        let parent_directory = std::fs::File::open(parent)
+            .map_err(|error| format!("failed to open audit log parent directory: {error}"))?;
+
+        parent_directory
+            .sync_all()
+            .map_err(|error| format!("failed to sync audit log parent directory: {error}"))?;
+    }
 
     Ok(())
 }
@@ -269,6 +326,79 @@ mod tests {
         let mode = metadata.permissions().mode() & 0o777;
 
         assert_eq!(mode, 0o600);
+
+        std::fs::remove_dir_all(&base)
+            .map_err(|error| format!("failed to remove test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[test]
+    fn persist_audit_creates_then_appends_records() -> Result<(), String> {
+        let base = std::env::temp_dir().join(format!(
+            "zyguor-audit-create-append-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&base)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let audit_path = base.join("audit.jsonl");
+
+        let first_request_id = Uuid::new_v4();
+        let second_request_id = Uuid::new_v4();
+
+        let first_request_id_text = first_request_id.to_string();
+        let second_request_id_text = second_request_id.to_string();
+
+        let first = AuditRecord::new(
+            first_request_id,
+            "first durable audit record",
+            PolicyDecision::Allow,
+            PolicyReason::Safe,
+            AuditPhase::Completion,
+            ExecutionOutcome::Success,
+        )
+        .map_err(|error| format!("failed to create first audit record: {error}"))?;
+
+        let second = AuditRecord::new(
+            second_request_id,
+            "second durable audit record",
+            PolicyDecision::Allow,
+            PolicyReason::Safe,
+            AuditPhase::Completion,
+            ExecutionOutcome::Success,
+        )
+        .map_err(|error| format!("failed to create second audit record: {error}"))?;
+
+        persist_audit(&audit_path, &first)?;
+        persist_audit(&audit_path, &second)?;
+
+        let contents = std::fs::read_to_string(&audit_path)
+            .map_err(|error| format!("failed to read audit log: {error}"))?;
+
+        let lines: Vec<&str> = contents.lines().collect();
+
+        assert_eq!(lines.len(), 2);
+
+        let first_value: serde_json::Value = serde_json::from_str(lines[0])
+            .map_err(|error| format!("first audit line was invalid JSON: {error}"))?;
+
+        let second_value: serde_json::Value = serde_json::from_str(lines[1])
+            .map_err(|error| format!("second audit line was invalid JSON: {error}"))?;
+
+        assert_eq!(
+            first_value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str),
+            Some(first_request_id_text.as_str())
+        );
+
+        assert_eq!(
+            second_value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str),
+            Some(second_request_id_text.as_str())
+        );
 
         std::fs::remove_dir_all(&base)
             .map_err(|error| format!("failed to remove test directory: {error}"))?;
