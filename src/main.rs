@@ -13,7 +13,7 @@ mod workspace_fingerprint;
 mod workspace_snapshot;
 use workspace_fingerprint::compute_workspace_fingerprint;
 
-use audit::{AuditPhase, AuditRecord, ExecutionOutcome, persist_audit};
+use audit::{AnchoredAuditLog, AuditPhase, AuditRecord, AuditSink, ExecutionOutcome};
 use cargo_test::{CargoTestExecutor, CargoTestResult};
 use config::{GatewayConfig, resolve_gateway_config};
 use execution::{
@@ -139,7 +139,7 @@ struct ZyguorGateway {
     filesystem: FileSystemCapability,
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     config: Arc<GatewayConfig>,
-    audit_log_path: Arc<PathBuf>,
+    audit_log_path: Arc<dyn AuditSink>,
     audit_lock: Arc<Mutex<()>>,
 }
 
@@ -390,12 +390,22 @@ where
     serde_json::to_string(&response)
         .map_err(|error| format!("failed to serialize gateway response: {error}"))
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedOperationalStatePath {
+    path: PathBuf,
+
+    #[cfg(unix)]
+    parent_device: u64,
+
+    #[cfg(unix)]
+    parent_inode: u64,
+}
 fn validate_operational_state_path(
     workspace_root: &Path,
     state_path: &Path,
     setting_name: &str,
     file_description: &str,
-) -> Result<(), String> {
+) -> Result<ValidatedOperationalStatePath, String> {
     if !state_path.is_absolute() {
         return Err(format!("{setting_name} must be an absolute path"));
     }
@@ -417,6 +427,23 @@ fn validate_operational_state_path(
             parent.display()
         )
     })?;
+    #[cfg(unix)]
+    let (parent_device, parent_inode) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(&canonical_parent).map_err(|error| {
+            format!(
+                "failed to inspect {file_description} parent '{}': {error}",
+                canonical_parent.display()
+            )
+        })?;
+
+        if !metadata.is_dir() {
+            return Err(format!("{file_description} parent must be a directory"));
+        }
+
+        (metadata.dev(), metadata.ino())
+    };
 
     let file_name = state_path
         .file_name()
@@ -464,7 +491,15 @@ fn validate_operational_state_path(
         ));
     }
 
-    Ok(())
+    Ok(ValidatedOperationalStatePath {
+        path: resolved_state_path,
+
+        #[cfg(unix)]
+        parent_device,
+
+        #[cfg(unix)]
+        parent_inode,
+    })
 }
 
 fn build_execution_request(params: &ExecuteParams) -> Result<ExecutionRequest, String> {
@@ -1053,7 +1088,7 @@ fn handle_admin_command_with_http_runner<H>(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
-    audit_log_path: &Path,
+    audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
     http_post_runner: H,
 ) -> Result<AdminOutcome, String>
@@ -1261,7 +1296,7 @@ fn handle_admin_command_with_config(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
-    audit_log_path: &Path,
+    audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
 ) -> Result<AdminOutcome, String> {
     handle_admin_command_with_http_runner(
@@ -1280,7 +1315,7 @@ fn execute_request_with_http_runner<H>(
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
-    audit_log_path: &Path,
+    audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
     http_runner: H,
 ) -> Result<String, String>
@@ -1387,7 +1422,7 @@ fn execute_request_with_config(
     filesystem: &FileSystemCapability,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     config: &GatewayConfig,
-    audit_log_path: &Path,
+    audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
 ) -> Result<String, String> {
     execute_request_with_http_runner(
@@ -1406,14 +1441,14 @@ fn execute_request_with_config(
 }
 fn persist_audit_locked(
     audit_lock: &Mutex<()>,
-    audit_log_path: &Path,
+    audit_log: &dyn AuditSink,
     record: &AuditRecord<'_>,
 ) -> Result<(), String> {
     let _guard = audit_lock
         .lock()
         .map_err(|_| "audit log lock poisoned".to_owned())?;
 
-    persist_audit(audit_log_path, record)
+    audit_log.persist_record(record)
 }
 
 #[tool_router(server_handler)]
@@ -1427,7 +1462,7 @@ impl ZyguorGateway {
             &self.filesystem,
             &self.pending_reviews,
             self.config.as_ref(),
-            self.audit_log_path.as_path(),
+            self.audit_log_path.as_ref(),
             self.audit_lock.as_ref(),
         ) {
             Ok(result) => result,
@@ -1498,7 +1533,7 @@ async fn handle_admin_connection(
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
     filesystem: &FileSystemCapability,
     config: &GatewayConfig,
-    audit_log_path: &Path,
+    audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
 ) -> Result<AdminOutcome, String> {
     let reader = BufReader::new(stream);
@@ -1601,7 +1636,7 @@ async fn run_admin_listener(
     pending_reviews: Arc<Mutex<PendingReviewStore>>,
     filesystem: FileSystemCapability,
     config: Arc<GatewayConfig>,
-    audit_log_path: Arc<PathBuf>,
+    audit_log_path: Arc<dyn AuditSink>,
     audit_lock: Arc<Mutex<()>>,
 ) -> Result<(), String> {
     loop {
@@ -1615,7 +1650,7 @@ async fn run_admin_listener(
             &pending_reviews,
             &filesystem,
             &config,
-            audit_log_path.as_path(),
+            audit_log_path.as_ref(),
             &audit_lock,
         )
         .await
@@ -1677,12 +1712,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_owned()
     })?;
 
-    validate_operational_state_path(
+    let validated_pending_review_state = validate_operational_state_path(
         Path::new(&workspace_root),
         &pending_review_state_path,
         "ZYGUOR_PENDING_REVIEW_STATE_PATH",
         "pending review state file",
     )?;
+
+    let pending_review_state_path = validated_pending_review_state.path.clone();
 
     let audit_log_path = std::env::var("ZYGUOR_AUDIT_LOG_PATH")
     .map(PathBuf::from)
@@ -1691,17 +1728,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_owned()
     })?;
 
-    validate_operational_state_path(
+    let validated_audit_log = validate_operational_state_path(
         Path::new(&workspace_root),
         &audit_log_path,
         "ZYGUOR_AUDIT_LOG_PATH",
         "audit log file",
     )?;
 
-    let audit_log_path = Arc::new(audit_log_path);
+    let audit_log_path: Arc<dyn AuditSink> = Arc::new(
+        AnchoredAuditLog::from_validated_path(
+            &validated_audit_log.path,
+            validated_audit_log.parent_device,
+            validated_audit_log.parent_inode,
+        )
+        .map_err(|error| format!("failed to initialize anchored audit log: {error}"))?,
+    );
+
     let audit_lock = Arc::new(Mutex::new(()));
-    let pending_review_store = PendingReviewStore::load_from_path(&pending_review_state_path)
-        .map_err(|error| format!("failed to load pending review state: {error}"))?;
+    let pending_review_store = PendingReviewStore::load_from_validated_path(
+        &pending_review_state_path,
+        validated_pending_review_state.parent_device,
+        validated_pending_review_state.parent_inode,
+    )
+    .map_err(|error| format!("failed to load pending review state: {error}"))?;
 
     let claimed_review_count = pending_review_store.claimed_count();
 
@@ -5706,7 +5755,7 @@ mod tests {
         use std::fs;
 
         let test_root = std::env::temp_dir().join(format!(
-            "zyguor-review-state-path-test-{}",
+            "zyguor-review-state-outside-workspace-test-{}",
             uuid::Uuid::new_v4()
         ));
 
@@ -5714,10 +5763,10 @@ mod tests {
         let operational_dir = test_root.join("operational-state");
 
         fs::create_dir_all(&workspace)
-            .map_err(|error| format!("failed to create workspace: {error}"))?;
+            .map_err(|error| format!("failed to create test workspace: {error}"))?;
 
         fs::create_dir_all(&operational_dir)
-            .map_err(|error| format!("failed to create operational directory: {error}"))?;
+            .map_err(|error| format!("failed to create operational state directory: {error}"))?;
 
         let state_path = operational_dir.join("pending-reviews.json");
 
@@ -5728,10 +5777,25 @@ mod tests {
             "pending review state file",
         );
 
+        let validated = result?;
+
+        let expected_parent = fs::canonicalize(&operational_dir)
+            .map_err(|error| format!("failed to resolve test operational directory: {error}"))?;
+
+        assert_eq!(validated.path, expected_parent.join("pending-reviews.json"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = fs::metadata(&expected_parent).map_err(|error| {
+                format!("failed to inspect test operational directory: {error}")
+            })?;
+
+            assert_eq!(validated.parent_device, metadata.dev());
+            assert_eq!(validated.parent_inode, metadata.ino());
+        }
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
-
-        assert_eq!(result, Ok(()));
 
         Ok(())
     }

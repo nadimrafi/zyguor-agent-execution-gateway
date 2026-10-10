@@ -1,12 +1,16 @@
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
-    io::Write,
+    ffi::CString,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -253,6 +257,7 @@ pub struct PendingReviewStore {
     reviews: HashMap<Uuid, PendingReview>,
     claimed_reviews: HashMap<Uuid, PendingReview>,
     persistence_path: Option<PathBuf>,
+    persistence_parent: Option<File>,
 
     #[cfg(test)]
     persistence_test_fault: Option<PersistenceTestFault>,
@@ -264,9 +269,16 @@ impl PendingReviewStore {
     }
 
     fn persist(&self) -> Result<(), PersistenceFailure> {
-        match &self.persistence_path {
-            Some(path) => self.save_to_path_classified(path),
-            None => Ok(()),
+        match (&self.persistence_path, &self.persistence_parent) {
+            (Some(path), Some(parent_directory)) => {
+                self.save_to_anchored_path_classified(path, parent_directory)
+            }
+
+            (None, None) => Ok(()),
+
+            _ => Err(PersistenceFailure::BeforeCommit(
+                "pending review persistence state is incomplete".to_owned(),
+            )),
         }
     }
     pub(crate) fn consume_claimed_classified(
@@ -376,56 +388,195 @@ impl PendingReviewStore {
         Ok(store)
     }
 
-    pub fn load_from_path(path: &Path) -> Result<Self, String> {
-        let mut store = match std::fs::read_to_string(path) {
-            Ok(contents) => Self::from_serialized_state(&contents)?,
+    fn load_from_path_with_parent_identity(
+        path: &Path,
+        expected_parent_identity: Option<(u64, u64)>,
+    ) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
 
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::new(),
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| "pending review state path must include a file name".to_owned())?;
 
-            Err(error) => {
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+            format!(
+                "failed to resolve pending review state parent '{}': {error}",
+                parent.display()
+            )
+        })?;
+
+        let mut parent_options = OpenOptions::new();
+        parent_options.read(true);
+
+        #[cfg(unix)]
+        parent_options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+
+        let parent_directory = parent_options.open(&canonical_parent).map_err(|error| {
+            format!(
+                "failed to open pending review state parent directory '{}': {error}",
+                canonical_parent.display()
+            )
+        })?;
+
+        let parent_metadata = parent_directory.metadata().map_err(|error| {
+            format!(
+                "failed to inspect pending review state parent directory '{}': {error}",
+                canonical_parent.display()
+            )
+        })?;
+
+        if !parent_metadata.is_dir() {
+            return Err("pending review state parent must be a directory".to_owned());
+        }
+        #[cfg(unix)]
+        if let Some((expected_device, expected_inode)) = expected_parent_identity {
+            use std::os::unix::fs::MetadataExt;
+
+            let actual_device = parent_metadata.dev();
+            let actual_inode = parent_metadata.ino();
+
+            if actual_device != expected_device || actual_inode != expected_inode {
                 return Err(format!(
-                    "failed to read pending review state file '{}': {error}",
-                    path.display()
+                    "pending review state parent directory changed after validation: \
+             expected device {expected_device} inode {expected_inode}, \
+             found device {actual_device} inode {actual_inode}"
                 ));
+            }
+        }
+
+        #[cfg(unix)]
+        let mut store = {
+            let file_name_c = CString::new(file_name.as_bytes()).map_err(|_| {
+                "pending review state file name contains an invalid NUL byte".to_owned()
+            })?;
+
+            let raw_fd = unsafe {
+                libc::openat(
+                    parent_directory.as_raw_fd(),
+                    file_name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+
+            if raw_fd >= 0 {
+                let mut file = unsafe { File::from_raw_fd(raw_fd) };
+
+                let metadata = file.metadata().map_err(|error| {
+                    format!(
+                        "failed to inspect opened pending review state file '{}': {error}",
+                        path.display()
+                    )
+                })?;
+
+                if !metadata.is_file() {
+                    return Err("pending review state file must be a regular file".to_owned());
+                }
+
+                let mut contents = String::new();
+
+                file.read_to_string(&mut contents).map_err(|error| {
+                    format!(
+                        "failed to read pending review state file '{}': {error}",
+                        path.display()
+                    )
+                })?;
+
+                Self::from_serialized_state(&contents)?
+            } else {
+                let error = std::io::Error::last_os_error();
+
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Self::new()
+                } else if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err("pending review state file must not be a symbolic link".to_owned());
+                } else {
+                    return Err(format!(
+                        "failed to open pending review state file '{}': {error}",
+                        path.display()
+                    ));
+                }
             }
         };
 
-        store.persistence_path = Some(path.to_path_buf());
+        store.persistence_path = Some(canonical_parent.join(file_name));
+        store.persistence_parent = Some(parent_directory);
 
         Ok(store)
     }
+    #[cfg(test)]
+    pub fn load_from_path(path: &Path) -> Result<Self, String> {
+        Self::load_from_path_with_parent_identity(path, None)
+    }
 
-    fn save_to_path_classified(&self, path: &Path) -> Result<(), PersistenceFailure> {
+    #[cfg(unix)]
+    pub fn load_from_validated_path(
+        path: &Path,
+        expected_parent_device: u64,
+        expected_parent_inode: u64,
+    ) -> Result<Self, String> {
+        Self::load_from_path_with_parent_identity(
+            path,
+            Some((expected_parent_device, expected_parent_inode)),
+        )
+    }
+
+    fn save_to_anchored_path_classified(
+        &self,
+        path: &Path,
+        parent_directory: &File,
+    ) -> Result<(), PersistenceFailure> {
         let serialized = self
             .serialize_state()
             .map_err(PersistenceFailure::BeforeCommit)?;
 
-        let parent = path.parent().ok_or_else(|| {
-            PersistenceFailure::BeforeCommit(
-                "pending review state path must have a parent directory".to_owned(),
-            )
-        })?;
-
-        path.file_name().ok_or_else(|| {
+        let file_name = path.file_name().ok_or_else(|| {
             PersistenceFailure::BeforeCommit(
                 "pending review state path must include a file name".to_owned(),
             )
         })?;
 
-        let temporary_path = parent.join(format!(".zyguor-pending-reviews-{}.tmp", Uuid::new_v4()));
+        #[cfg(unix)]
+        let file_name_c = CString::new(file_name.as_bytes()).map_err(|_| {
+            PersistenceFailure::BeforeCommit(
+                "pending review state file name contains an invalid NUL byte".to_owned(),
+            )
+        })?;
 
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        let temporary_name = format!(".zyguor-pending-reviews-{}.tmp", Uuid::new_v4());
 
         #[cfg(unix)]
-        options.mode(0o600);
+        let temporary_name_c = CString::new(temporary_name.as_bytes()).map_err(|_| {
+            PersistenceFailure::BeforeCommit(
+                "temporary pending review state file name contains an invalid NUL byte".to_owned(),
+            )
+        })?;
 
+        #[cfg(unix)]
         let save_result = (|| -> Result<(), PersistenceFailure> {
-            let mut temporary_file = options.open(&temporary_path).map_err(|error| {
-                PersistenceFailure::BeforeCommit(format!(
+            let raw_fd = unsafe {
+                libc::openat(
+                    parent_directory.as_raw_fd(),
+                    temporary_name_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600 as libc::c_uint,
+                )
+            };
+
+            if raw_fd < 0 {
+                let error = std::io::Error::last_os_error();
+
+                return Err(PersistenceFailure::BeforeCommit(format!(
                     "failed to create temporary pending review state file: {error}"
-                ))
-            })?;
+                )));
+            }
+
+            let mut temporary_file = unsafe { File::from_raw_fd(raw_fd) };
 
             temporary_file
                 .write_all(serialized.as_bytes())
@@ -443,12 +594,6 @@ impl PendingReviewStore {
 
             drop(temporary_file);
 
-            #[cfg(unix)]
-            let parent_directory = std::fs::File::open(parent).map_err(|error| {
-                PersistenceFailure::BeforeCommit(format!(
-                    "failed to open pending review state parent directory for sync: {error}"
-                ))
-            })?;
             #[cfg(test)]
             if matches!(
                 self.persistence_test_fault,
@@ -459,11 +604,22 @@ impl PendingReviewStore {
                 ));
             }
 
-            std::fs::rename(&temporary_path, path).map_err(|error| {
-                PersistenceFailure::BeforeCommit(format!(
+            let rename_result = unsafe {
+                libc::renameat(
+                    parent_directory.as_raw_fd(),
+                    temporary_name_c.as_ptr(),
+                    parent_directory.as_raw_fd(),
+                    file_name_c.as_ptr(),
+                )
+            };
+
+            if rename_result != 0 {
+                let error = std::io::Error::last_os_error();
+
+                return Err(PersistenceFailure::BeforeCommit(format!(
                     "failed to atomically replace pending review state file: {error}"
-                ))
-            })?;
+                )));
+            }
 
             #[cfg(test)]
             if matches!(
@@ -475,7 +631,6 @@ impl PendingReviewStore {
                 ));
             }
 
-            #[cfg(unix)]
             parent_directory.sync_all().map_err(|error| {
                 PersistenceFailure::AfterCommit(format!(
                     "pending review state was replaced but parent directory sync failed: {error}"
@@ -485,19 +640,46 @@ impl PendingReviewStore {
             Ok(())
         })();
 
+        #[cfg(unix)]
         if save_result.is_err() {
-            match std::fs::remove_file(&temporary_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {}
+            let unlink_result = unsafe {
+                libc::unlinkat(parent_directory.as_raw_fd(), temporary_name_c.as_ptr(), 0)
+            };
+
+            if unlink_result != 0 {
+                let error = std::io::Error::last_os_error();
+
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    // Preserve the original persistence error.
+                }
             }
         }
 
-        save_result
+        #[cfg(unix)]
+        {
+            save_result
+        }
     }
     #[cfg(test)]
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        self.save_to_path_classified(path)
+        let parent = path
+            .parent()
+            .ok_or_else(|| "pending review state path must have a parent directory".to_owned())?;
+
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(|error| format!("failed to resolve pending review state parent: {error}"))?;
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+
+        #[cfg(unix)]
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+
+        let parent_directory = options
+            .open(&canonical_parent)
+            .map_err(|error| format!("failed to open pending review state parent: {error}"))?;
+
+        self.save_to_anchored_path_classified(path, &parent_directory)
             .map_err(PersistenceFailure::into_message)
     }
 
@@ -1363,6 +1545,71 @@ mod tests {
 
         Ok(())
     }
+    #[cfg(unix)]
+    #[test]
+    fn persistence_remains_anchored_after_parent_path_replacement() -> Result<(), String> {
+        use std::fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-anchored-parent-replacement-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let operational_dir = test_root.join("operational-state");
+        let moved_trusted_dir = test_root.join("trusted-state-moved");
+
+        fs::create_dir_all(&operational_dir)
+            .map_err(|error| format!("failed to create operational directory: {error}"))?;
+
+        let state_path = operational_dir.join("pending-reviews.json");
+        let request_id = uuid::Uuid::new_v4();
+
+        // Loading anchors the store to the original operational directory FD.
+        let mut store = PendingReviewStore::load_from_path(&state_path)?;
+
+        // Move the trusted directory away from its original pathname.
+        fs::rename(&operational_dir, &moved_trusted_dir)
+            .map_err(|error| format!("failed to move trusted operational directory: {error}"))?;
+
+        // Replace the original pathname with a different directory.
+        fs::create_dir_all(&operational_dir).map_err(|error| {
+            format!("failed to create replacement operational directory: {error}")
+        })?;
+
+        let pending = PendingReview::new_with_write_target_state(
+            request_id,
+            ExecutionRequest::WriteFile(WriteFileArguments {
+                path: "config/settings.txt".to_owned(),
+                content: "enabled=true".to_owned(),
+            }),
+            "Test anchored operational persistence".to_owned(),
+            WriteTargetState::Missing,
+        );
+
+        store.insert(pending.clone())?;
+
+        let trusted_state_path = moved_trusted_dir.join("pending-reviews.json");
+        let replacement_state_path = operational_dir.join("pending-reviews.json");
+
+        assert!(
+            trusted_state_path.exists(),
+            "state must be written through the originally anchored parent directory"
+        );
+
+        assert!(
+            !replacement_state_path.exists(),
+            "state must not be redirected into the replacement parent directory"
+        );
+
+        let restored = PendingReviewStore::load_from_path(&trusted_state_path)?;
+
+        assert_eq!(restored.get(&request_id), Some(&pending));
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
 
     #[test]
     fn pending_review_survives_store_reload() -> Result<(), String> {
@@ -1499,6 +1746,100 @@ mod tests {
 
         fs::remove_dir_all(&test_root)
             .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pending_review_loader_rejects_symlink() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-pending-review-loader-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        fs::create_dir_all(&test_root)
+            .map_err(|error| format!("failed to create test directory: {error}"))?;
+
+        let real_state_path = test_root.join("real-pending-reviews.json");
+        let symlink_path = test_root.join("pending-reviews.json");
+
+        fs::write(
+            &real_state_path,
+            r#"{
+  "version": 3,
+  "reviews": []
+}"#,
+        )
+        .map_err(|error| format!("failed to create real pending review state file: {error}"))?;
+
+        symlink(&real_state_path, &symlink_path)
+            .map_err(|error| format!("failed to create pending review state symlink: {error}"))?;
+
+        let result = PendingReviewStore::load_from_path(&symlink_path);
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        let error = result.expect_err("symlink state path should be rejected");
+
+        assert_eq!(
+            error,
+            "pending review state file must not be a symbolic link"
+        );
+
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn validated_loader_rejects_replaced_parent_directory() -> Result<(), String> {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "zyguor-validated-loader-parent-replacement-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let operational_dir = test_root.join("operational-state");
+        let moved_trusted_dir = test_root.join("trusted-state-moved");
+
+        fs::create_dir_all(&operational_dir)
+            .map_err(|error| format!("failed to create operational directory: {error}"))?;
+
+        let metadata = fs::metadata(&operational_dir)
+            .map_err(|error| format!("failed to inspect operational directory: {error}"))?;
+
+        let expected_device = metadata.dev();
+        let expected_inode = metadata.ino();
+
+        let state_path = operational_dir.join("pending-reviews.json");
+
+        // Simulate replacement after validation but before the loader opens the parent.
+        fs::rename(&operational_dir, &moved_trusted_dir)
+            .map_err(|error| format!("failed to move trusted operational directory: {error}"))?;
+
+        fs::create_dir_all(&operational_dir).map_err(|error| {
+            format!("failed to create replacement operational directory: {error}")
+        })?;
+
+        let result = PendingReviewStore::load_from_validated_path(
+            &state_path,
+            expected_device,
+            expected_inode,
+        );
+
+        fs::remove_dir_all(&test_root)
+            .map_err(|error| format!("failed to clean up test directory: {error}"))?;
+
+        let error = result.expect_err("replaced parent directory should be rejected");
+
+        assert!(
+            error.starts_with("pending review state parent directory changed after validation:"),
+            "unexpected error: {error}"
+        );
 
         Ok(())
     }
