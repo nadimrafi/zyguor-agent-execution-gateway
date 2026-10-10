@@ -351,4 +351,19 @@ mod tests {
 
         Ok(())
     }
+    #[test]
+    fn production_executor_reports_fuel_exhaustion() {
+        let executor = SandboxExecutor::new(SandboxConfig {
+            fuel_limit: 1,
+            memory_limit_bytes: 2 * 1024 * 1024,
+            timeout: Duration::from_millis(250),
+        });
+
+        let result = executor.run_addition(2, 3);
+
+        assert!(
+            result.is_err(),
+            "production SandboxExecutor should fail when configured fuel is insufficient"
+        );
+    }
 }

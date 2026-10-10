@@ -1528,6 +1528,75 @@ async fn create_admin_listener(socket_path: &Path) -> Result<UnixListener, Strin
 
     Ok(listener)
 }
+#[cfg(target_os = "macos")]
+fn admin_peer_uid(stream: &tokio::net::UnixStream) -> Result<libc::uid_t, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut peer_uid: libc::uid_t = 0;
+    let mut peer_gid: libc::gid_t = 0;
+
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) };
+
+    if result != 0 {
+        return Err(format!(
+            "failed to determine admin peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(peer_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn admin_peer_uid(stream: &tokio::net::UnixStream) -> Result<libc::uid_t, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut length,
+        )
+    };
+
+    if result != 0 {
+        return Err(format!(
+            "failed to determine admin peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(credentials.uid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn admin_peer_uid(_stream: &tokio::net::UnixStream) -> Result<libc::uid_t, String> {
+    Err("admin peer credential verification is unsupported on this platform".to_owned())
+}
+
+fn verify_admin_peer_uid(
+    stream: &tokio::net::UnixStream,
+    expected_uid: libc::uid_t,
+) -> Result<(), String> {
+    let peer_uid = admin_peer_uid(stream)?;
+
+    if peer_uid != expected_uid {
+        return Err("admin connection rejected: peer user does not match gateway owner".to_owned());
+    }
+
+    Ok(())
+}
+
+fn verify_admin_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
+    let expected_uid = unsafe { libc::geteuid() };
+
+    verify_admin_peer_uid(stream, expected_uid)
+}
 async fn handle_admin_connection(
     stream: tokio::net::UnixStream,
     pending_reviews: &Arc<Mutex<PendingReviewStore>>,
@@ -1536,6 +1605,7 @@ async fn handle_admin_connection(
     audit_log_path: &dyn AuditSink,
     audit_lock: &Mutex<()>,
 ) -> Result<AdminOutcome, String> {
+    verify_admin_peer(&stream)?;
     let reader = BufReader::new(stream);
     let mut reader = reader.take((MAX_ADMIN_COMMAND_LENGTH + 1) as u64);
     let mut input = String::new();
@@ -1957,13 +2027,14 @@ mod gateway_tests {
     fn sandbox_must_not_run() -> Result<ExecutionResult, String> {
         Err("sandbox was called unexpectedly".to_owned())
     }
+
     #[tokio::test]
     async fn admin_connection_rejects_pending_request() -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
-        let socket_path =
-            std::env::temp_dir().join(format!("zyguor-admin-{}.sock", uuid::Uuid::new_v4()));
+        let socket_path = std::path::PathBuf::from("/tmp")
+            .join(format!("za-{}.sock", uuid::Uuid::new_v4().simple()));
 
         let listener = create_admin_listener(&socket_path).await?;
         let pending_reviews = empty_pending_review_store();
@@ -6478,6 +6549,52 @@ mod tests {
         assert_eq!(request_ids.len(), expected_records);
 
         remove_test_audit_log(&audit_path);
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn admin_connection_rejects_mismatched_peer_uid() -> Result<(), String> {
+        use tokio::net::UnixStream;
+
+        let socket_path = std::path::PathBuf::from("/tmp")
+            .join(format!("za-{}.sock", uuid::Uuid::new_v4().simple()));
+
+        let listener = create_admin_listener(&socket_path).await?;
+
+        let client_path = socket_path.clone();
+
+        let client = tokio::spawn(async move {
+            UnixStream::connect(&client_path)
+                .await
+                .map_err(|error| format!("failed to connect to admin socket: {error}"))
+        });
+
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("failed to accept admin connection: {error}"))?;
+
+        let current_uid = unsafe { libc::geteuid() };
+
+        let mismatched_uid = if current_uid == 0 { 1 } else { 0 };
+
+        let result = super::verify_admin_peer_uid(&stream, mismatched_uid);
+
+        drop(stream);
+
+        client
+            .await
+            .map_err(|error| format!("admin client task failed: {error}"))??;
+
+        drop(listener);
+
+        std::fs::remove_file(&socket_path)
+            .map_err(|error| format!("failed to remove test admin socket: {error}"))?;
+
+        assert_eq!(
+            result,
+            Err("admin connection rejected: peer user does not match gateway owner".to_owned())
+        );
 
         Ok(())
     }

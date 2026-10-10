@@ -8,6 +8,16 @@ use url::Host;
 use crate::{
     cargo_test::CargoTestConfig, http_execution::HttpExecutionConfig, sandbox::SandboxConfig,
 };
+const MAX_HTTP_TIMEOUT_SECONDS: u64 = 60;
+const MAX_HTTP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+const MAX_CARGO_TEST_TIMEOUT_SECONDS: u64 = 10 * 60;
+const MAX_CARGO_OUTPUT_BYTES: usize = 1024 * 1024;
+
+const MAX_SANDBOX_FUEL_LIMIT: u64 = 10_000_000;
+const MAX_SANDBOX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SANDBOX_TIMEOUT_MILLISECONDS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct HttpPolicyConfig {
@@ -263,6 +273,24 @@ impl HttpPolicyConfig {
             return Err("HTTP maximum response body size must be greater than zero".to_owned());
         }
 
+        if self.execution.timeout > Duration::from_secs(MAX_HTTP_TIMEOUT_SECONDS) {
+            return Err(format!(
+                "HTTP timeout must not exceed {MAX_HTTP_TIMEOUT_SECONDS} seconds"
+            ));
+        }
+
+        if self.execution.max_request_body_bytes > MAX_HTTP_REQUEST_BODY_BYTES {
+            return Err(format!(
+                "HTTP maximum request body size must not exceed {MAX_HTTP_REQUEST_BODY_BYTES} bytes"
+            ));
+        }
+
+        if self.execution.max_response_body_bytes > MAX_HTTP_RESPONSE_BODY_BYTES {
+            return Err(format!(
+                "HTTP maximum response body size must not exceed {MAX_HTTP_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+
         let mut seen_hosts = HashSet::new();
 
         for allowed_host in &self.allowed_hosts {
@@ -277,6 +305,7 @@ impl HttpPolicyConfig {
 
             let domain = match parsed_host {
                 Host::Domain(domain) => domain,
+
                 Host::Ipv4(_) | Host::Ipv6(_) => {
                     return Err(format!(
                         "HTTP allowed host must not be an IP literal: {host}"
@@ -316,6 +345,24 @@ impl GatewayConfig {
             return Err("Cargo test stderr limit must be greater than zero".to_owned());
         }
 
+        if self.cargo_test.timeout > Duration::from_secs(MAX_CARGO_TEST_TIMEOUT_SECONDS) {
+            return Err(format!(
+                "Cargo test timeout must not exceed {MAX_CARGO_TEST_TIMEOUT_SECONDS} seconds"
+            ));
+        }
+
+        if self.cargo_test.max_stdout_bytes > MAX_CARGO_OUTPUT_BYTES {
+            return Err(format!(
+                "Cargo test stdout limit must not exceed {MAX_CARGO_OUTPUT_BYTES} bytes"
+            ));
+        }
+
+        if self.cargo_test.max_stderr_bytes > MAX_CARGO_OUTPUT_BYTES {
+            return Err(format!(
+                "Cargo test stderr limit must not exceed {MAX_CARGO_OUTPUT_BYTES} bytes"
+            ));
+        }
+
         if self.sandbox.fuel_limit == 0 {
             return Err("sandbox fuel limit must be greater than zero".to_owned());
         }
@@ -328,6 +375,24 @@ impl GatewayConfig {
             return Err("sandbox timeout must be greater than zero".to_owned());
         }
 
+        if self.sandbox.fuel_limit > MAX_SANDBOX_FUEL_LIMIT {
+            return Err(format!(
+                "sandbox fuel limit must not exceed {MAX_SANDBOX_FUEL_LIMIT}"
+            ));
+        }
+
+        if self.sandbox.memory_limit_bytes > MAX_SANDBOX_MEMORY_BYTES {
+            return Err(format!(
+                "sandbox memory limit must not exceed {MAX_SANDBOX_MEMORY_BYTES} bytes"
+            ));
+        }
+
+        if self.sandbox.timeout > Duration::from_millis(MAX_SANDBOX_TIMEOUT_MILLISECONDS) {
+            return Err(format!(
+                "sandbox timeout must not exceed {MAX_SANDBOX_TIMEOUT_MILLISECONDS} milliseconds"
+            ));
+        }
+
         Ok(())
     }
 }
@@ -337,8 +402,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        GatewayConfig, load_gateway_config_from_path, parse_gateway_config_toml,
-        resolve_gateway_config,
+        GatewayConfig, MAX_CARGO_OUTPUT_BYTES, MAX_CARGO_TEST_TIMEOUT_SECONDS,
+        MAX_HTTP_REQUEST_BODY_BYTES, MAX_HTTP_RESPONSE_BODY_BYTES, MAX_HTTP_TIMEOUT_SECONDS,
+        MAX_SANDBOX_FUEL_LIMIT, MAX_SANDBOX_MEMORY_BYTES, MAX_SANDBOX_TIMEOUT_MILLISECONDS,
+        load_gateway_config_from_path, parse_gateway_config_toml, resolve_gateway_config,
     };
 
     use crate::policy::PolicyDecision;
@@ -821,5 +888,94 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+    #[test]
+    fn accepts_configuration_at_resource_upper_bounds() {
+        let mut config = GatewayConfig::default();
+
+        config.http.execution.timeout = Duration::from_secs(MAX_HTTP_TIMEOUT_SECONDS);
+        config.http.execution.max_request_body_bytes = MAX_HTTP_REQUEST_BODY_BYTES;
+        config.http.execution.max_response_body_bytes = MAX_HTTP_RESPONSE_BODY_BYTES;
+
+        config.cargo_test.timeout = Duration::from_secs(MAX_CARGO_TEST_TIMEOUT_SECONDS);
+        config.cargo_test.max_stdout_bytes = MAX_CARGO_OUTPUT_BYTES;
+        config.cargo_test.max_stderr_bytes = MAX_CARGO_OUTPUT_BYTES;
+
+        config.sandbox.fuel_limit = MAX_SANDBOX_FUEL_LIMIT;
+        config.sandbox.memory_limit_bytes = MAX_SANDBOX_MEMORY_BYTES;
+        config.sandbox.timeout = Duration::from_millis(MAX_SANDBOX_TIMEOUT_MILLISECONDS);
+
+        assert_eq!(config.validate(), Ok(()));
+    }
+    #[test]
+    fn rejects_http_timeout_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.http.execution.timeout = Duration::from_secs(MAX_HTTP_TIMEOUT_SECONDS + 1);
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_http_request_body_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.http.execution.max_request_body_bytes = MAX_HTTP_REQUEST_BODY_BYTES + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_http_response_body_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.http.execution.max_response_body_bytes = MAX_HTTP_RESPONSE_BODY_BYTES + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cargo_timeout_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.cargo_test.timeout = Duration::from_secs(MAX_CARGO_TEST_TIMEOUT_SECONDS + 1);
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cargo_stdout_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.cargo_test.max_stdout_bytes = MAX_CARGO_OUTPUT_BYTES + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cargo_stderr_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.cargo_test.max_stderr_bytes = MAX_CARGO_OUTPUT_BYTES + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_sandbox_fuel_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.sandbox.fuel_limit = MAX_SANDBOX_FUEL_LIMIT + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_sandbox_memory_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.sandbox.memory_limit_bytes = MAX_SANDBOX_MEMORY_BYTES + 1;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_sandbox_timeout_above_maximum() {
+        let mut config = GatewayConfig::default();
+        config.sandbox.timeout = Duration::from_millis(MAX_SANDBOX_TIMEOUT_MILLISECONDS + 1);
+
+        assert!(config.validate().is_err());
     }
 }
